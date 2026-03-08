@@ -1,0 +1,16 @@
+{
+    "include": [
+        ".",
+        "layer1_sops",
+        "layer2_navigation",
+        "layer3_tools"
+    ],
+    "venvPath": "/Users/aithocine/Snack-Flow-System",
+    "venv": "venv",
+    "pythonVersion": "3.9",
+    "pythonPlatform": "Darwin",
+    "typeCheckingMode": "basic",
+    "reportMissingImports": true,
+    "reportMissingModuleSource": false,
+    "reportGeneralTypeIssues": "warning"
+}

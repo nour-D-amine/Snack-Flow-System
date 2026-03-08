@@ -1,0 +1,10 @@
+✅ SNACK-FLOW SYSTEM — AGENT EN LIGNE
+
+Agent    : Antigravity (Gemini Advanced Agentic)
+Projet   : Snack-Flow-System
+Chemin   : /Users/aithocine/Snack-Flow-System/
+Date     : 2026-03-07T19:27:51+01:00
+
+Je suis bien là. Prêt à construire, déboguer et déployer.
+Framework : BLAST | Architecture : ANT (SOPs / Navigation / Tools)
+North Star : Zéro friction pour le restaurateur. 🚀
