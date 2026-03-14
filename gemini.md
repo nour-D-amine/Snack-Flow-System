@@ -1,38 +1,60 @@
-# Project Constitution (Protocol Zero)
+# Project Constitution (Protocol Zero) — v2.0 Full-WhatsApp
 
 ## North Star
-"Transformer chaque appel entrant en une commande finalisée ou un transfert réussi, avec zéro friction pour le restaurateur."
-Objectif concret : Automatiser l'envoi d'un lien de commande par SMS en < 3 secondes après le choix de l'utilisateur, et tracer chaque interaction.
+"Transformer chaque message WhatsApp entrant en une commande confirmée, avec zéro friction pour le client et un ticket cuisine instantané pour le snack."
+Objectif concret : Traiter un message WhatsApp entrant, logger la commande dans Supabase, envoyer une confirmation au client et un ticket cuisine au snack — le tout en < 3 secondes.
 
-## Integrations (Links)
-1. **Twilio API** : Appels entrants, menu IVR (1 ou 2), SMS sortants.
-2. **WhatsApp Business API** : Notifications structurées "Ticket Cuisine".
-3. **Python Tooling** : Manipulation des numéros (E.164), génération de logs.
+## Architecture Full-WhatsApp (pivot v2.0)
+```
+CLIENT WhatsApp
+    │  message texte libre
+    ▼
+/webhook POST  (Layer 2 — whatsapp_webhook.py)
+    │  parsing payload Meta réel
+    │  exécution asynchrone
+    ├──► upsert_customer()   → Supabase (Layer 3)
+    ├──► log_order()         → Supabase (Layer 3)
+    ├──► send_menu()         → WhatsApp Client (confirmation)
+    └──► send_kitchen_ticket() → WhatsApp Snack (ticket cuisine)
+```
+
+## Integrations
+1. **WhatsApp Business API (Meta Graph)** : Messages entrants (webhook), menus interactifs, tickets cuisine, remarketing.
+2. **Supabase (PostgreSQL)** : Source de vérité unique — snacks, orders, customers, interactions.
+3. **Python Tooling** : Normalisation E.164, parsing payload Meta, génération de logs.
 
 ## Source of Truth
-**Notion (Base de données 'Snack-Flow Master')** - CRM et registre de commandes.
-- Contenu: Historique, téléphones, choix (1 ou 2), statut (Lien envoyé / Échec).
+**Supabase** (projet `SnackFlow-system`, région eu-west-3 Paris).
+- `snacks`       → Configuration des restaurants (credentials WA, menu_url, seuil fidélité)
+- `orders`       → Journal horodaté de chaque commande
+- `customers`    → CRM clients (fidélité, remarketing)
+- `interactions` → Historique des échanges WhatsApp
 
 ## Delivery Payload
-- **Vers le Client** : SMS Twilio avec lien dynamique vers menu interactif.
-- **Vers le Restaurant** : Message WhatsApp détaillé dès la fin de l'action IVR.
+- **Vers le Client** : Message WhatsApp interactif (bouton menu + confirmation commande).
+- **Vers le Snack**  : Ticket cuisine WhatsApp formaté dès réception du message.
 
 ## Core Precepts
 - Determinism
 - Self-Healing
 - Data-First
 
-## Data Schemas
-(To be defined in Phase 2/3)
-
 ## Behavioral Rules
-- **Schema-First** : Always define the JSON schema before writing code.
-- **Self-Healing** : If a tool fails, analyze the error and propose a fix automatically.
-- **Determinism** : Logic must produce consistent results. No hallucination sur les prix/items. Uniquement les données de Notion.
-- **Formatage E.164** : Normalisation au format international (ex: +33) avant tout envoi.
-- **Fallback Rapide** : Si échec de SMS, notification WhatsApp immédiate d'échec pour rappel manuel.
-- **Vitesse (Priorité asynchrone)** : Exécution asynchrone pour ne pas faire attendre le client.
+- **Schema-First** : Toujours définir le schéma JSON avant d'écrire le code.
+- **Self-Healing** : Si WhatsApp ou Supabase échoue, logger l'erreur et continuer sans crash.
+- **Determinism** : Uniquement les données Supabase. Aucun prix ou item inventé.
+- **Formatage E.164** : Normalisation systématique avant tout INSERT ou envoi WhatsApp.
+- **Fallback Rapide** : Si envoi WhatsApp échoue → log `status="Échec"` dans Supabase + alerte interne.
+- **Vitesse (Priorité asynchrone)** : Réponse 202 immédiate au webhook Meta, traitement en thread.
+
+## Ce qui est SUPPRIMÉ (v1 → v2)
+- ~~Twilio~~ — aucun service vocal
+- ~~IVR (menu 1/2)~~ — aucun appel téléphonique
+- ~~SMS~~ — WhatsApp uniquement
+- ~~Google Sheets~~ — Supabase uniquement
+- ~~Notion~~ — Supabase uniquement
+- ~~SQLite (crm_tool)~~ — Supabase uniquement
 
 ## Architectural Invariants
 - BLAST Framework
-- ANT Layer Architecture (SOPs, Navigation, Tools)
+- ANT Layer Architecture (SOPs → Navigation → Tools)

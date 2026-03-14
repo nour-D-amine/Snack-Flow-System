@@ -27,6 +27,8 @@ rsa==4.9.1
 StrEnum==0.4.15
 flask>=3.0.0
 supabase>=2.4.0
+google-generativeai>=0.8.0
+psycopg2-binary>=2.9.0
 twilio==9.10.2
 typing_extensions==4.15.0
 urllib3==2.6.3

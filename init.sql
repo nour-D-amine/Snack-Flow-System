@@ -1,14 +1,12 @@
 -- =============================================================================
--- Snack-Flow — Schéma SQL Supabase (PostgreSQL) v3.0 Full-WhatsApp
+-- Snack-Flow — init.sql — Schéma Multi-Tenant SaaS (v3.0)
 -- =============================================================================
 -- Architecture : Multi-Tenant via snack_id (UUID) — isolation par restaurant
 -- Exécuter dans : Supabase Dashboard → SQL Editor → Nouveau script
 --
--- Ce fichier = Documentation/Référence. Pour appliquer le schéma, utilisez init.sql
---
 -- Tables :
 --   1. snacks   → Tenants (restaurants enregistrés, authentifiés par phone_number_id)
---   2. orders  → Commandes WhatsApp (JSONB items, isolées par snack_id)
+--   2. orders    → Commandes WhatsApp (JSONB items, isolées par snack_id)
 --   3. customers → CRM clients (fidélité, remarketing)
 --
 -- Sécurité :
@@ -17,11 +15,14 @@
 --   - Accès serveur via service_role key uniquement
 -- =============================================================================
 
-
--- ─────────────────────────────────────────────────────────────────────────────
--- EXTENSION UUID (activée par défaut sur Supabase, idempotent)
--- ─────────────────────────────────────────────────────────────────────────────
+-- ─── Extension UUID ──────────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ─── Nettoyage de l'ancien schéma (v2) ──────────────────────────────────────
+DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS interactions CASCADE;
+DROP TABLE IF EXISTS customers CASCADE;
+DROP TABLE IF EXISTS snacks CASCADE;
 
 
 -- =============================================================================
@@ -55,12 +56,12 @@ CREATE INDEX IF NOT EXISTS idx_snacks_phone_number_id
 
 -- Trigger : mise à jour automatique de updated_at
 CREATE OR REPLACE FUNCTION snacks_set_updated_at()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_snacks_updated_at ON snacks;
 CREATE TRIGGER trg_snacks_updated_at
@@ -135,7 +136,7 @@ CREATE POLICY "orders_tenant_isolation" ON orders
 
 -- =============================================================================
 -- 3. TABLE : customers
---    Profil CRM de chaque client, isolé par tenant.
+--    Profils clients CRM mis à jour à chaque message WhatsApp pour le tenant.
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -165,7 +166,7 @@ CREATE TABLE IF NOT EXISTS customers (
     UNIQUE (phone_e164, snack_id)
 );
 
--- Index pour les requêtes de remarketing et de lecture fréquente
+-- Index pour les requêtes CRM
 CREATE INDEX IF NOT EXISTS idx_customers_snack_id    ON customers (snack_id);
 CREATE INDEX IF NOT EXISTS idx_customers_phone       ON customers (phone_e164);
 CREATE INDEX IF NOT EXISTS idx_customers_last_contact ON customers (last_contact ASC);
@@ -179,73 +180,15 @@ CREATE POLICY "customers_service_role_only" ON customers
 
 
 -- =============================================================================
--- 4. TABLE : interactions
---    Historique de chaque échange WhatsApp (message entrant ou sortant).
---    NOTE: Cette table est optionnelle dans v3.0 - voir init.sql
+-- DONNÉES DE TEST — Snack exemple (désactivé par défaut)
 -- =============================================================================
-
-CREATE TABLE IF NOT EXISTS interactions (
-    -- Clé primaire
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-    -- Identifiant multi-tenant (UUID FK vers snacks)
-    snack_id            UUID NOT NULL REFERENCES snacks(id) ON DELETE CASCADE,
-
-    -- Numéro client E.164
-    phone_e164          TEXT NOT NULL,
-
-    -- Direction : "inbound" (client → snack) | "outbound" (snack → client)
-    wa_direction        TEXT NOT NULL DEFAULT 'inbound'
-                            CHECK (wa_direction IN ('inbound', 'outbound')),
-
-    -- Type d'échange : "order" | "confirmation" | "kitchen_ticket" | "remarketing" | "other"
-    wa_type             TEXT NOT NULL DEFAULT 'order'
-                            CHECK (wa_type IN ('order', 'confirmation', 'kitchen_ticket', 'remarketing', 'other')),
-
-    -- Statut de l'envoi WhatsApp
-    wa_status           TEXT NOT NULL DEFAULT 'En attente'
-                            CHECK (wa_status IN ('Envoyé', 'Échec', 'En attente')),
-
-    -- Contenu court du message (facultatif — pour debug)
-    message_preview     TEXT DEFAULT '',
-
-    -- Timestamp UTC
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Index pour l'historique par client + tenant
-CREATE INDEX IF NOT EXISTS idx_interactions_snack_id  ON interactions (snack_id);
-CREATE INDEX IF NOT EXISTS idx_interactions_phone     ON interactions (phone_e164);
-CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions (created_at DESC);
-
--- Row Level Security
-ALTER TABLE interactions ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "interactions_service_role_only" ON interactions;
-CREATE POLICY "interactions_service_role_only" ON interactions
-    USING (auth.role() = 'service_role');
+-- Décommentez et adaptez pour insérer un tenant de test :
+--
+-- INSERT INTO snacks (name, whatsapp_phone_number_id, is_active)
+-- VALUES ('Snack Demo Paris', '123456789012345', TRUE)
+-- ON CONFLICT (whatsapp_phone_number_id) DO NOTHING;
 
 
 -- =============================================================================
--- VUE : v_restaurant_stats
--- =============================================================================
-
-CREATE OR REPLACE VIEW v_restaurant_stats AS
-SELECT
-    s.id             AS snack_id,
-    s.name           AS nom_resto,
-    COUNT(DISTINCT c.id)    AS total_customers,
-    COALESCE(SUM(c.total_orders), 0) AS total_orders,
-    COUNT(DISTINCT CASE
-        WHEN i.created_at >= NOW() - INTERVAL '30 days'
-        THEN i.phone_e164 END
-    )                       AS active_last_30d
-FROM snacks s
-LEFT JOIN customers     c ON c.snack_id = s.id
-LEFT JOIN orders        o ON o.snack_id = s.id
-LEFT JOIN interactions  i ON i.snack_id = s.id
-GROUP BY s.id, s.name;
-
--- =============================================================================
--- FIN DU SCRIPT v3.0
+-- FIN DU SCRIPT init.sql v3.0
 -- =============================================================================

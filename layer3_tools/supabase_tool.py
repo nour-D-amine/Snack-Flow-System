@@ -1,20 +1,18 @@
 """
-Layer 3 — Tools : Supabase Connector (Snack-Flow)
-==================================================
+Layer 3 — Tools : Supabase Connector (Snack-Flow v2.0 Full-WhatsApp)
+=====================================================================
 Connecteur principal vers la base de données Supabase (PostgreSQL).
-Remplace à terme :
-  - gsheets_tool.py    → tables snacks + orders
-  - crm_tool.py (SQLite) → table customers + interactions
+Source de vérité unique du système — remplace GSheets, SQLite, Notion.
 
 Architecture Multi-Tenant :
   - Chaque enregistrement porte un snack_id (isolation par tenant).
-  - Row Level Security (RLS) activable côté Supabase pour isolation forte.
+  - Row Level Security (RLS) activé côté Supabase.
 
 Tables gérées :
-  - snacks        : configuration des restaurants (ex-onglet RESTOS)
-  - orders        : journal des commandes (ex-onglet COMMANDES)
-  - customers     : profil client CRM (ex-SQLite clients)
-  - interactions  : historique des appels IVR (ex-SQLite interactions)
+  - snacks        : configuration des restaurants (credentials WA, menu_url)
+  - orders        : journal des commandes WhatsApp
+  - customers     : profil client CRM (fidélité, remarketing)
+  - interactions  : historique des échanges WhatsApp
 
 Principes :
   - Zéro ORM lourd : uniquement supabase-py (wrapper léger PostgREST).
@@ -23,8 +21,8 @@ Principes :
   - Formatage E.164 : normalisé en amont (phone_tool) avant tout INSERT.
 
 Variables .env requises :
-  SUPABASE_URL          https://xxxx.supabase.co
-  SUPABASE_SERVICE_KEY  eyJh... (service_role key — côté serveur uniquement)
+  SUPABASE_URL               https://xxxx.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY  eyJh... (service_role key — côté serveur uniquement)
 """
 
 import os
@@ -50,12 +48,62 @@ logger.setLevel(logging.INFO)
 
 # ─── Noms des tables (source de vérité) ───────────────────────────────────────
 
-TABLE_SNACKS       = "snacks"
-TABLE_ORDERS       = "orders"
-TABLE_CUSTOMERS    = "customers"
-TABLE_INTERACTIONS = "interactions"
+TABLE_SNACKS        = "snacks"
+TABLE_ORDERS        = "orders"
+TABLE_CUSTOMERS     = "customers"
 
-# ─── Client Supabase (singleton) ──────────────────────────────────────────────
+# ─── Client Supabase (Singleton class) ────────────────────────────────────────
+
+
+class SupabaseClient:
+    """
+    Singleton thread-safe du client Supabase.
+
+    Usage :
+        sb = SupabaseClient.instance()
+        sb.table("snacks").select("*").execute()
+
+    Variables .env requises :
+        SUPABASE_URL              https://xxxx.supabase.co
+        SUPABASE_SERVICE_ROLE_KEY eyJh...  (service_role key — serveur uniquement)
+    """
+
+    _instance: Optional["SupabaseClient"] = None
+    _client: Optional[Client] = None
+    _lock = __import__("threading").Lock()
+
+    def __new__(cls) -> "SupabaseClient":
+        with cls._lock:
+            if cls._instance is None:
+                obj = super().__new__(cls)
+                url = os.getenv("SUPABASE_URL", "").strip()
+                key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+                if not url or not key:
+                    raise RuntimeError(
+                        "❌ SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis dans .env\n"
+                        "   Récupérez-les dans : Supabase Dashboard → Settings → API"
+                    )
+                obj._client = create_client(url, key)   # assign to local obj first
+                cls._instance = obj                     # commit singleton only after success
+                logger.info("✅ SupabaseClient (singleton) initialisé → %s", url)
+        return cls._instance
+
+    @classmethod
+    def instance(cls) -> "SupabaseClient":
+        """Retourne l'instance singleton (crée si nécessaire)."""
+        return cls()
+
+    def table(self, name: str):
+        """Proxy vers supabase_client.table()."""
+        return self._client.table(name)  # type: ignore[union-attr]
+
+    @property
+    def raw(self) -> Client:
+        """Accès direct au client Supabase natif (usage avancé)."""
+        return self._client  # type: ignore[return-value]
+
+
+# ─── Helpers backward-compat ──────────────────────────────────────────────────
 
 _supabase_client: Optional[Client] = None
 
@@ -71,11 +119,11 @@ def get_client() -> Client:
         return _supabase_client
 
     url = os.getenv("SUPABASE_URL", "").strip()
-    key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
     if not url or not key:
         raise RuntimeError(
-            "❌ SUPABASE_URL et SUPABASE_SERVICE_KEY sont requis dans le fichier .env\n"
+            "❌ SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis dans le fichier .env\n"
             "   Récupérez-les dans : Supabase Dashboard → Settings → API"
         )
 
@@ -97,20 +145,63 @@ def get_snack_config(snack_id: str) -> dict:
     :return: Dictionnaire de configuration complet.
     :raises KeyError: Si le snack_id est introuvable.
     """
-    try:
-        sb = get_client()
-        response = (
-            sb.table(TABLE_SNACKS)
-            .select("*")
-            .eq("snack_id", snack_id.strip())
-            .single()
-            .execute()
+    def _enrich(config: dict) -> dict:
+        """Injecte les alias rétrocompat pour whatsapp_tool.py v2."""
+        config["snack_id"]          = config.get("id")
+        config["nom_resto"]         = config.get("name")
+        config["whatsapp_phone_id"] = (
+            config.get("whatsapp_phone_number_id")
+            or os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
         )
-        if response.data:
-            logger.info("✅ Config snack chargée : %s", snack_id)
-            return response.data
+        if not config["whatsapp_phone_id"]:
+            logger.warning("⚠️  get_snack_config : whatsapp_phone_id vide pour '%s'", sid)
+        config["whatsapp_token"]    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+        if not config["whatsapp_token"]:
+            logger.warning("⚠️  get_snack_config : WHATSAPP_ACCESS_TOKEN non configuré !")
+        config["menu_url"]          = os.getenv("MENU_URL", "https://le-menu.app")
+        config["loyalty_threshold"] = 3
+        config["resto_phone"]       = os.getenv("RESTO_PHONE", "+33600000000")
+        return config
+
+    try:
+        sb  = SupabaseClient.instance()
+        sid = snack_id.strip()
+
+        # Tentative 1 : lookup par UUID (id) — chemin nominal
+        try:
+            response = (
+                sb.table(TABLE_SNACKS)
+                .select("*")
+                .eq("id", sid)
+                .single()
+                .execute()
+            )
+            if response.data:
+                logger.info("✅ Config snack chargée (by id) : %s", sid)
+                return _enrich(response.data)
+        except Exception:
+            pass  # single() lève si 0 résultat → on essaie le fallback
+
+        # Tentative 2 : lookup par name (fallback dev / DEFAULT_SNACK_ID lisible)
+        try:
+            response2 = (
+                sb.table(TABLE_SNACKS)
+                .select("*")
+                .eq("name", sid)
+                .single()
+                .execute()
+            )
+            if response2.data:
+                logger.warning(
+                    "⚠️  get_snack_config : '%s' résolu via name, pas un UUID. "
+                    "Mettez à jour DEFAULT_SNACK_ID dans .env avec l'UUID Supabase.", sid
+                )
+                return _enrich(response2.data)
+        except Exception:
+            pass
+
         raise KeyError(
-            f"snack_id '{snack_id}' introuvable dans la table '{TABLE_SNACKS}'."
+            f"snack_id '{sid}' introuvable dans Supabase (ni par id, ni par name)."
         )
     except KeyError:
         raise
@@ -127,11 +218,11 @@ def list_all_snacks() -> list:
     :return: Liste de dictionnaires (un par restaurant).
     """
     try:
-        sb = get_client()
+        sb = SupabaseClient.instance()
         response = (
             sb.table(TABLE_SNACKS)
             .select("*")
-            .order("snack_id")
+            .order("id")
             .execute()
         )
         restaurants = response.data or []
@@ -142,43 +233,130 @@ def list_all_snacks() -> list:
         return []
 
 
+def get_snack_by_phone_id(phone_id: str) -> Optional[dict]:
+    """
+    Authentifie un tenant entrant via son whatsapp_phone_number_id.
+
+    Utilisé par le webhook Flask pour router chaque requête Meta vers
+    le bon restaurant. Retourne None si introuvable ou inactif.
+
+    :param phone_id: Valeur de metadata.phone_number_id reçue de Meta.
+    :return: Enregistrement snack complet (dict) ou None.
+    """
+    try:
+        sb = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_SNACKS)
+            .select("*")
+            .eq("whatsapp_phone_number_id", phone_id.strip())
+            .eq("is_active", True)
+            .single()
+            .execute()
+        )
+        if response.data:
+            logger.info("✅ Tenant authentifié : phone_number_id=%s → snack id=%s",
+                        phone_id, response.data.get("id"))
+            return response.data
+        logger.warning("⚠️  [UNAUTHORIZED_SNACK] phone_number_id=%s → aucun snack actif", phone_id)
+        return None
+    except Exception as e:
+        logger.error("❌ get_snack_by_phone_id(%s) : %s", phone_id, e)
+        return None
+
+
+def create_order(snack_id: str, data: dict) -> dict:
+    """
+    Enregistre une nouvelle commande dans la table 'orders' (schéma init.sql v3).
+
+    :param snack_id: UUID du restaurant (PK de la table snacks).
+    :param data: Dictionnaire contenant au minimum :
+                   - customer_phone (str E.164)
+                   - items          (list de dicts)
+                   - status         (str, défaut "pending")
+    :return: Ligne insérée ou dict d'erreur.
+    """
+    try:
+        sb = SupabaseClient.instance()
+        row = {
+            "snack_id":       snack_id.strip(),
+            "customer_phone": data.get("customer_phone", "").strip(),
+            "items":          data.get("items", []),
+            "status":         data.get("status", "pending"),
+        }
+        response = sb.table(TABLE_ORDERS).insert(row).execute()
+        result = response.data[0] if response.data else row
+        logger.info("✅ create_order : snack=%s | phone=%s | status=%s",
+                    snack_id, row["customer_phone"], row["status"])
+        return {"status": "success", "row": result}
+    except Exception as e:
+        logger.error("❌ create_order(%s) : %s", snack_id, e)
+        return {"status": "error", "message": str(e)}
+
+
 def upsert_snack(
-    snack_id: str,
-    nom_resto: str,
-    whatsapp_phone_id: str,
-    whatsapp_token: str,
+    name: str,
+    whatsapp_phone_number_id: str,
+    is_active: bool = True,
+    # Legacy params kept for backward-compat (ignored in v3 schema)
+    snack_id: str = "",
+    nom_resto: str = "",
+    whatsapp_phone_id: str = "",
+    whatsapp_token: str = "",
     menu_url: str = "",
     loyalty_threshold: int = 5,
     resto_phone: str = "",
 ) -> dict:
     """
-    Crée ou met à jour un restaurant dans la table 'snacks'.
-    Idempotent grâce au ON CONFLICT sur snack_id (clé primaire).
+    Crée ou met à jour un restaurant dans la table 'snacks' (schéma v3.0).
 
-    :return: Enregistrement créé/mis à jour.
+    Schéma v3 :
+      - name                     : Nom du restaurant
+      - whatsapp_phone_number_id : ID Meta (clé d'authentification tenant)
+      - is_active                : Actif/inactif
+
+    :return: Enregistrement créé/mis à jour (dict avec 'id' UUID).
     """
+    # Résolution du nom (compat legacy)
+    resolved_name = name.strip() if name.strip() else nom_resto.strip()
+    resolved_phone_id = (
+        whatsapp_phone_number_id.strip()
+        if whatsapp_phone_number_id.strip()
+        else whatsapp_phone_id.strip()
+    )
+
+    # Avertissement explicite : ces colonnes n'existent pas dans le schéma v3 (init.sql).
+    # Si vous en avez besoin, ajoutez-les via une migration SQL avant de les utiliser ici.
+    _legacy_with_values = {
+        k: v for k, v in {
+            "menu_url": menu_url,
+            "loyalty_threshold": loyalty_threshold if loyalty_threshold != 5 else None,
+            "resto_phone": resto_phone,
+        }.items() if v
+    }
+    if _legacy_with_values:
+        logger.warning(
+            "⚠️  upsert_snack : paramètre(s) ignoré(s) — absent(s) du schéma v3 : %s. "
+            "Ces valeurs NE SONT PAS enregistrées en base. "
+            "Créez une migration SQL pour ajouter ces colonnes.", list(_legacy_with_values.keys())
+        )
+
     try:
-        sb = get_client()
+        sb = SupabaseClient.instance()
         data = {
-            "snack_id":           snack_id.strip(),
-            "nom_resto":          nom_resto.strip(),
-            "whatsapp_phone_id":  whatsapp_phone_id.strip(),
-            "whatsapp_token":     whatsapp_token.strip(),
-            "menu_url":           menu_url.strip(),
-            "loyalty_threshold":  loyalty_threshold,
-            "resto_phone":        resto_phone.strip(),
-            "updated_at":         datetime.now(timezone.utc).isoformat(),
+            "name":                     resolved_name,
+            "whatsapp_phone_number_id": resolved_phone_id,
+            "is_active":                is_active,
         }
         response = (
             sb.table(TABLE_SNACKS)
-            .upsert(data, on_conflict="snack_id")
+            .upsert(data, on_conflict="whatsapp_phone_number_id")
             .execute()
         )
         result = response.data[0] if response.data else data
-        logger.info("✅ Snack upsert : %s (%s)", snack_id, nom_resto)
+        logger.info("✅ Snack upsert v3 : '%s' | phone_id=%s", resolved_name, resolved_phone_id)
         return result
     except Exception as e:
-        logger.error("❌ upsert_snack(%s) : %s", snack_id, e)
+        logger.error("❌ upsert_snack('%s') : %s", resolved_name, e)
         return {"error": str(e)}
 
 
@@ -190,33 +368,75 @@ def log_order(
     snack_id: str,
     customer_phone: str,
     order_details: str = "",
-    status: str = "Lien envoyé",
+    status: str = "pending",
+    items: Optional[list] = None,
 ) -> dict:
     """
-    Insère une nouvelle ligne dans la table 'orders'.
-    Équivalent de gsheets_tool.log_order().
+    Insère une nouvelle ligne dans la table 'orders' (schéma v3.0 — JSONB items).
 
-    :param snack_id:       Identifiant du restaurant (FK vers snacks).
+    :param snack_id:       UUID du restaurant (FK vers snacks.id).
     :param customer_phone: Numéro client au format E.164.
-    :param order_details:  Description libre de la commande.
-    :param status:         "Lien envoyé" | "Échec" | "En attente".
+    :param order_details:  Texte brut de la commande (converti en items JSONB si items=None).
+    :param status:         "pending" | "confirmed" | "failed" | "cancelled".
+    :param items:          Liste JSONB structurée [{"name": ..., "qty": ...}].
+                           Si None (legacy), sera encapsulé depuis order_details.
     :return: Ligne insérée ou dict d'erreur.
     """
+    # Validation des valeurs status acceptées par la contrainte CHECK
+    _valid_statuses = {"pending", "confirmed", "failed", "cancelled"}
+    if status not in _valid_statuses:
+        logger.warning("⚠️  log_order : statut invalide '%s' → forcé à 'pending'", status)
+        status = "pending"
+
+    # Conversion order_details → JSONB items si items non fournis
+    if items is None:
+        items = [{"name": order_details or "Commande WhatsApp", "qty": 1}]
+
     try:
-        sb = get_client()
+        sb = SupabaseClient.instance()
         row = {
             "snack_id":       snack_id.strip(),
             "customer_phone": customer_phone.strip(),
-            "order_details":  order_details,
+            "items":          items,
             "status":         status,
-            "created_at":     datetime.now(timezone.utc).isoformat(),
         }
         response = sb.table(TABLE_ORDERS).insert(row).execute()
         result = response.data[0] if response.data else row
-        logger.info("✅ Order loguée : %s | %s | %s", snack_id, customer_phone, status)
+        logger.info("✅ Order loguée v3 : %s | %s | %s", snack_id, customer_phone, status)
         return {"status": "success", "row": result}
     except Exception as e:
         logger.error("❌ log_order : %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+def update_order_status(order_id: str, status: str, snack_id: str = "") -> dict:
+    """
+    Met à jour le statut d'une commande existante.
+
+    :param order_id: UUID de la commande (retourné par log_order / create_order).
+    :param status:   "pending" | "confirmed" | "failed" | "cancelled".
+    :param snack_id: (optionnel) UUID du tenant — filtre de sécurité multi-tenant.
+    :return: Ligne mise à jour ou dict d'erreur.
+    """
+    _valid_statuses = {"pending", "confirmed", "failed", "cancelled"}
+    if status not in _valid_statuses:
+        logger.warning("⚠️  update_order_status : statut invalide '%s' → forcé à 'pending'", status)
+        status = "pending"
+    try:
+        sb = SupabaseClient.instance()
+        query = (
+            sb.table(TABLE_ORDERS)
+            .update({"status": status})
+            .eq("id", order_id)
+        )
+        if snack_id:
+            query = query.eq("snack_id", snack_id.strip())
+        response = query.execute()
+        result = response.data[0] if response.data else {"id": order_id, "status": status}
+        logger.info("✅ update_order_status : id=%s → %s", order_id, status)
+        return {"status": "success", "row": result}
+    except Exception as e:
+        logger.error("❌ update_order_status(%s) : %s", order_id, e)
         return {"status": "error", "message": str(e)}
 
 
@@ -229,7 +449,7 @@ def get_orders(snack_id: str, limit: int = 100) -> list:
     :return: Liste de commandes.
     """
     try:
-        sb = get_client()
+        sb = SupabaseClient.instance()
         response = (
             sb.table(TABLE_ORDERS)
             .select("*")
@@ -244,199 +464,75 @@ def get_orders(snack_id: str, limit: int = 100) -> list:
         return []
 
 
+
+
+
 # =============================================================================
-# TABLE : customers — CRM client (remplace SQLite clients)
+# TABLE : customers — CRM client
 # =============================================================================
 
-def upsert_customer(
-    phone_e164: str,
-    snack_id: str,
-    ivr_choice: str = "",
-) -> dict:
+def upsert_customer(phone_e164: str, snack_id: str) -> dict:
     """
-    Crée ou met à jour le profil d'un client.
-    Equivalent de crm_tool.upsert_client().
-    - Première fois → INSERT
-    - Fois suivantes → UPDATE last_contact + total_orders si ivr_choice == "1"
+    Crée ou met à jour le profil CRM d'un client dans la table 'customers'.
 
-    :param phone_e164: Numéro client E.164.
-    :param snack_id:   Identifiant du restaurant.
-    :param ivr_choice: Choix IVR ("1" ou "2").
-    :return: Profil client mis à jour.
+    - INSERT la première fois (first_contact = NOW()).
+    - UPDATE last_contact + total_orders += 1 les fois suivantes.
+
+    :param phone_e164: Numéro client au format E.164 (ex: "+33785557054").
+    :param snack_id:   UUID du restaurant (FK vers snacks.id, ou snack_id texte legacy).
+    :return: Profil client créé/mis à jour, ou dict d'erreur.
     """
     try:
-        sb = get_client()
+        sb  = SupabaseClient.instance()
         now = datetime.now(timezone.utc).isoformat()
-        is_order = ivr_choice.strip() == "1"
+        phone = phone_e164.strip()
+        sid   = snack_id.strip()
 
-        # Vérifie si le client existe déjà
+        # Vérifier si le client existe déjà pour ce tenant
         existing = (
             sb.table(TABLE_CUSTOMERS)
             .select("*")
-            .eq("phone_e164", phone_e164.strip())
-            .eq("snack_id", snack_id.strip())
+            .eq("phone_e164", phone)
+            .eq("snack_id", sid)
             .execute()
         )
 
         if existing.data:
-            # Mise à jour
-            update_data: dict = {"last_contact": now}
-            if is_order:
-                current_orders = existing.data[0].get("total_orders", 0) or 0
-                update_data["total_orders"] = current_orders + 1
-
+            # Mise à jour : last_contact + compteur commandes
+            current_orders = existing.data[0].get("total_orders", 0) or 0
             response = (
                 sb.table(TABLE_CUSTOMERS)
-                .update(update_data)
-                .eq("phone_e164", phone_e164.strip())
-                .eq("snack_id", snack_id.strip())
+                .update({
+                    "last_contact":  now,
+                    "total_orders":  current_orders + 1,
+                })
+                .eq("phone_e164", phone)
+                .eq("snack_id",   sid)
                 .execute()
             )
             result = response.data[0] if response.data else existing.data[0]
-            logger.info("✅ Customer mis à jour : %s → %s", phone_e164, snack_id)
+            logger.info("✅ Customer mis à jour : %s → snack=%s", phone, sid)
         else:
             # Insertion
-            insert_data = {
-                "phone_e164":            phone_e164.strip(),
-                "snack_id":              snack_id.strip(),
-                "first_contact":         now,
-                "last_contact":          now,
-                "total_orders":          1 if is_order else 0,
-                "remarketing_eligible":  True,
-            }
             response = (
                 sb.table(TABLE_CUSTOMERS)
-                .insert(insert_data)
+                .insert({
+                    "phone_e164":           phone,
+                    "snack_id":             sid,
+                    "first_contact":        now,
+                    "last_contact":         now,
+                    "total_orders":         1,
+                    "remarketing_eligible": True,
+                })
                 .execute()
             )
-            result = response.data[0] if response.data else insert_data
-            logger.info("✅ Nouveau customer CRM : %s → %s", phone_e164, snack_id)
+            result = response.data[0] if response.data else {}
+            logger.info("✅ Nouveau customer CRM : %s → snack=%s", phone, sid)
 
         return result
 
     except Exception as e:
         logger.error("❌ upsert_customer(%s, %s) : %s", phone_e164, snack_id, e)
-        return {"error": str(e)}
-
-
-def get_customer(phone_e164: str, snack_id: str) -> Optional[dict]:
-    """
-    Retourne le profil d'un client, ou None s'il n'existe pas.
-    """
-    try:
-        sb = get_client()
-        response = (
-            sb.table(TABLE_CUSTOMERS)
-            .select("*")
-            .eq("phone_e164", phone_e164.strip())
-            .eq("snack_id", snack_id.strip())
-            .single()
-            .execute()
-        )
-        return response.data or None
-    except Exception:
-        return None
-
-
-def check_customer_loyalty(snack_id: str, customer_phone: str) -> str:
-    """
-    Détermine le statut de fidélité d'un client.
-    Équivalent de gsheets_tool.check_customer_loyalty().
-
-    Stratégie :
-      1. Récupère loyalty_threshold depuis snacks.
-      2. Compare total_orders du customer au seuil.
-
-    :return: "LOYAL" si commandes >= seuil, sinon "NEW".
-    """
-    try:
-        config = get_snack_config(snack_id)
-        threshold = int(config.get("loyalty_threshold", 0) or 0)
-
-        customer = get_customer(customer_phone, snack_id)
-        if not customer:
-            return "NEW"
-
-        total_orders = int(customer.get("total_orders", 0) or 0)
-        status = "LOYAL" if (threshold > 0 and total_orders >= threshold) else "NEW"
-
-        logger.info(
-            "📊 Fidélité [%s] %s : %d commande(s) / seuil %d → %s",
-            snack_id, customer_phone, total_orders, threshold, status,
-        )
-        return status
-
-    except Exception as e:
-        logger.error("❌ check_customer_loyalty : %s", e)
-        return "NEW"
-
-
-def get_remarketing_targets(snack_id: str, inactive_days: int = 30) -> list:
-    """
-    Retourne les clients éligibles au remarketing (inactifs depuis N jours).
-    Équivalent de crm_tool.get_remarketing_targets().
-    """
-    try:
-        sb = get_client()
-        # Supabase PostgREST : filtre sur last_contact via lt (less than)
-        cutoff = datetime.now(timezone.utc)
-        from datetime import timedelta
-        cutoff -= timedelta(days=inactive_days)
-
-        response = (
-            sb.table(TABLE_CUSTOMERS)
-            .select("*")
-            .eq("snack_id", snack_id.strip())
-            .eq("remarketing_eligible", True)
-            .gte("total_orders", 1)
-            .lt("last_contact", cutoff.isoformat())
-            .order("last_contact")
-            .execute()
-        )
-        targets = response.data or []
-        logger.info(
-            "📊 Remarketing '%s' : %d client(s) inactif(s) depuis %dj",
-            snack_id, len(targets), inactive_days,
-        )
-        return targets
-    except Exception as e:
-        logger.error("❌ get_remarketing_targets : %s", e)
-        return []
-
-
-# =============================================================================
-# TABLE : interactions — Historique IVR (remplace SQLite interactions)
-# =============================================================================
-
-def log_interaction(
-    phone_e164: str,
-    snack_id: str,
-    ivr_choice: str,
-    sms_status: str = "N/A",
-    transfer_status: str = "N/A",
-) -> dict:
-    """
-    Enregistre une interaction IVR dans la table 'interactions'.
-    Équivalent de crm_tool.log_interaction().
-
-    :return: Interaction insérée ou dict d'erreur.
-    """
-    try:
-        sb = get_client()
-        row = {
-            "phone_e164":      phone_e164.strip(),
-            "snack_id":        snack_id.strip(),
-            "ivr_choice":      ivr_choice,
-            "sms_status":      sms_status,
-            "transfer_status": transfer_status,
-            "created_at":      datetime.now(timezone.utc).isoformat(),
-        }
-        response = sb.table(TABLE_INTERACTIONS).insert(row).execute()
-        result = response.data[0] if response.data else row
-        logger.info("✅ Interaction loguée : %s | %s | %s", snack_id, phone_e164, ivr_choice)
-        return result
-    except Exception as e:
-        logger.error("❌ log_interaction : %s", e)
         return {"error": str(e)}
 
 
@@ -452,9 +548,9 @@ def health_check() -> dict:
     :return: {"status": "ok"|"error", "message": str}
     """
     try:
-        sb = get_client()
+        sb = SupabaseClient.instance()
         # Requête légère : compte le nombre de snacks
-        response = sb.table(TABLE_SNACKS).select("snack_id", count="exact").execute()
+        response = sb.table(TABLE_SNACKS).select("id", count="exact").execute()
         count = response.count or 0
         logger.info("✅ Supabase health check OK — %d snack(s) en base.", count)
         return {"status": "ok", "snacks_count": count}
@@ -478,17 +574,20 @@ if __name__ == "__main__":
 
     print("\n[2] Liste des snacks...")
     snacks = list_all_snacks()
-    print(f"   → {len(snacks)} restaurant(s) trovué(s)")
+    print(f"   → {len(snacks)} restaurant(s) trouvé(s)")
     for s in snacks:
-        print(f"     • [{s.get('snack_id')}] {s.get('nom_resto')}")
+        print(f"     • [id={s.get('id')}] {s.get('name')} | phone_id={s.get('whatsapp_phone_number_id')}")
 
-    print("\n[3] Test upsert customer...")
-    customer = upsert_customer("+33785557054", "SNACK_TEST_01", ivr_choice="1")
-    print("   →", customer)
-
-    print("\n[4] Test log order...")
-    order = log_order("SNACK_TEST_01", "+33785557054", "Test Supabase", "Lien envoyé")
-    print("   →", order)
+    print("\n[3] Test create_order (utilise le premier snack si disponible)...")
+    if snacks:
+        test_snack_id = snacks[0].get("id", "")
+        order = create_order(
+            snack_id=test_snack_id,
+            data={"customer_phone": "+33785557054", "items": [{"name": "Test", "qty": 1}], "status": "pending"},
+        )
+        print("   →", order)
+    else:
+        print("   ⚠️  Aucun snack en base — test ignoré.")
 
     print("\n" + "=" * 60)
     print("   ✅ Self-Test terminé")
