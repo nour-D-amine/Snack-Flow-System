@@ -622,7 +622,7 @@ if __name__ == "__main__":
     else:
         print("✅ Toutes les variables critiques sont présentes")
 
-    port = int(os.getenv("SERVER_PORT", 5001))
+    port = int(os.getenv("PORT", os.getenv("SERVER_PORT", 5001)))
     print(f"✅ Webhook prêt — En écoute sur http://0.0.0.0:{port}")
     print("   Routes disponibles :")
     print("   - POST /webhook → Message WhatsApp entrant (payload Meta réel)")
