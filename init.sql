@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS customers (
     preferences             TEXT DEFAULT '',
 
     -- Éligibilité au remarketing
-    remarketing_eligible    BOOLEAN NOT NULL DEFAULT TRUE,
+    remarketing_eligible    BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- Unicité : un seul profil par (phone, tenant)
     UNIQUE (phone_e164, snack_id)

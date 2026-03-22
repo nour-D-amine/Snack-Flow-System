@@ -522,7 +522,7 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
                     "first_contact":        now,
                     "last_contact":         now,
                     "total_orders":         1,
-                    "remarketing_eligible": True,
+                    "remarketing_eligible": False,
                 })
                 .execute()
             )
@@ -534,6 +534,58 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
     except Exception as e:
         logger.error("❌ upsert_customer(%s, %s) : %s", phone_e164, snack_id, e)
         return {"error": str(e)}
+
+
+def delete_customer_data(phone_e164: str, snack_id: str) -> dict:
+    """
+    Supprime toutes les données d'un client pour un tenant (droit à l'effacement RGPD Art. 17).
+
+    Supprime dans l'ordre :
+      1. Toutes ses commandes (table orders)
+      2. Son profil CRM (table customers)
+
+    :param phone_e164: Numéro client au format E.164.
+    :param snack_id:   UUID du restaurant (FK snacks.id).
+    :return: {"status": "deleted", "orders_deleted": int, "customer_deleted": bool}
+             ou {"status": "error", "message": str}
+    """
+    try:
+        sb    = SupabaseClient.instance()
+        phone = phone_e164.strip()
+        sid   = snack_id.strip()
+
+        # 1. Suppression des commandes liées au client pour ce tenant
+        orders_resp = (
+            sb.table(TABLE_ORDERS)
+            .delete()
+            .eq("customer_phone", phone)
+            .eq("snack_id", sid)
+            .execute()
+        )
+        orders_deleted = len(orders_resp.data) if orders_resp.data else 0
+
+        # 2. Suppression du profil CRM
+        customer_resp = (
+            sb.table(TABLE_CUSTOMERS)
+            .delete()
+            .eq("phone_e164", phone)
+            .eq("snack_id", sid)
+            .execute()
+        )
+        customer_deleted = bool(customer_resp.data)
+
+        logger.info(
+            "🗑️  RGPD delete : phone=%s | snack=%s | orders=%d | customer=%s",
+            phone, sid, orders_deleted, customer_deleted,
+        )
+        return {
+            "status":           "deleted",
+            "orders_deleted":   orders_deleted,
+            "customer_deleted": customer_deleted,
+        }
+    except Exception as e:
+        logger.error("❌ delete_customer_data(%s, %s) : %s", phone_e164, snack_id, e)
+        return {"status": "error", "message": str(e)}
 
 
 # =============================================================================

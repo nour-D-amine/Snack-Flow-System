@@ -47,6 +47,7 @@ from layer3_tools.supabase_tool import (
     get_snack_config,
     get_snack_by_phone_id,
     upsert_customer,
+    delete_customer_data,
     create_order,
     update_order_status,
     health_check as supabase_health,
@@ -63,6 +64,7 @@ _logger = logging.getLogger("snack_flow.webhook")
 DEFAULT_SNACK_ID      = os.getenv("DEFAULT_SNACK_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET   = os.getenv("WHATSAPP_APP_SECRET", "")
+ADMIN_API_KEY         = os.getenv("ADMIN_API_KEY", "")
 
 if not WHATSAPP_APP_SECRET:
     _logger.warning(
@@ -125,6 +127,92 @@ def _load_config(snack_id: str) -> Optional[dict]:
     except Exception as e:
         print(f"⚠️  Config introuvable pour snack_id='{snack_id}': {e}")
         return None
+
+
+# =============================================================================
+# RGPD — Helpers droits des personnes (Art. 13 & 17)
+# =============================================================================
+
+_DELETION_KEYWORDS = frozenset([
+    "supprimer mes donnees",
+    "supprime mes donnees",
+    "effacer mes donnees",
+    "delete my data",
+    "droit effacement",
+    "oubliez moi",
+    "oublie moi",
+])
+
+_RGPD_NOTICE = (
+    "ℹ️ *Vos données & RGPD*\n\n"
+    "Votre numéro et vos commandes sont traités par *{nom_resto}* "
+    "pour gérer votre relation client "
+    "(base légale : exécution du contrat — Art. 6(1)(b) RGPD).\n\n"
+    "📅 Conservation : 3 ans maximum.\n"
+    "🔐 Droits : accès, rectification, suppression.\n\n"
+    "Pour effacer vos données, répondez :\n"
+    "*SUPPRIMER MES DONNÉES*"
+)
+
+_DELETION_CONFIRM = (
+    "✅ Vos données ont bien été supprimées de nos systèmes.\n"
+    "Aucune information vous concernant n'est conservée chez *{nom_resto}*.\n\n"
+    "Merci de votre confiance."
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Normalise le texte pour matching insensible aux accents/casse."""
+    return (
+        text.lower()
+        .replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+        .replace("à", "a").replace("â", "a")
+        .replace("ô", "o").replace("î", "i")
+        .replace("ù", "u").replace("û", "u")
+        .replace("ç", "c")
+        .replace("\u2019", " ").replace("'", " ").replace("-", " ")
+    )
+
+
+def _is_deletion_request(text: str) -> bool:
+    """Détecte une demande RGPD d'effacement dans le message client."""
+    normalized = _normalize_for_match(text)
+    return any(kw in normalized for kw in _DELETION_KEYWORDS)
+
+
+def _send_rgpd_notice(config: dict, customer_phone: str, nom_resto: str) -> None:
+    """Envoie la notice d'information RGPD Art. 13 au premier contact client."""
+    body = _RGPD_NOTICE.format(nom_resto=nom_resto)
+    result = send_text_message(config, customer_phone, body)
+    if "error" not in result:
+        _logger.info("✅ Notice RGPD Art. 13 envoyée → %s", _redact(customer_phone))
+    else:
+        _logger.warning("⚠️  Notice RGPD échouée : %s", result.get("error"))
+
+
+def _handle_deletion_request(config: dict, snack_id: str, customer_phone: str) -> None:
+    """
+    Traite une demande d'effacement RGPD Art. 17.
+    Supprime toutes les données du client et envoie une confirmation WhatsApp.
+    """
+    _logger.info("🗑️  [RGPD] Demande d'effacement | %s", _redact(customer_phone))
+    result   = delete_customer_data(phone_e164=customer_phone, snack_id=snack_id)
+    nom_resto = config.get("nom_resto") or config.get("name", "Notre Snack")
+
+    if result.get("status") == "deleted":
+        body = _DELETION_CONFIRM.format(nom_resto=nom_resto)
+        _logger.info(
+            "✅ [RGPD] Données supprimées | phone=%s | orders=%d",
+            _redact(customer_phone), result.get("orders_deleted", 0),
+        )
+    else:
+        body = (
+            "⚠️ Une erreur est survenue lors de la suppression de vos données. "
+            "Veuillez contacter directement le restaurant."
+        )
+        _logger.error("❌ [RGPD] Échec suppression : %s", result.get("message"))
+
+    send_text_message(config, customer_phone, body)
 
 
 # =============================================================================
@@ -363,12 +451,27 @@ def _process_message(snack_id: str, from_phone: str, message_text: str, message_
 
     wa_status = "Échec"
 
+    # ── Détection demande RGPD (effacement Art. 17) ──────────────────────────
+    if message_type == "text" and _is_deletion_request(message_text):
+        _handle_deletion_request(config, snack_id, from_phone)
+        return
+
     # ── Étape 2 : Upsert customer CRM ────────────────────────────────────────
+    is_new_customer = False
     try:
-        upsert_customer(phone_e164=from_phone, snack_id=snack_id)
-        print(f"✅ [PROCESS] Customer CRM upserted : {_redact(from_phone)}")
+        customer_data   = upsert_customer(phone_e164=from_phone, snack_id=snack_id)
+        is_new_customer = isinstance(customer_data, dict) and customer_data.get("total_orders", 0) == 1
+        print(f"✅ [PROCESS] Customer CRM upserted : {_redact(from_phone)} | nouveau={is_new_customer}")
     except Exception as e:
         print(f"⚠️  [PROCESS] upsert_customer échoué (non bloquant) : {e}")
+
+    # ── Étape 2a : Notice RGPD Art. 13 au premier contact ────────────────────
+    if is_new_customer:
+        try:
+            nom_resto = config.get("nom_resto") or config.get("name", "Notre Snack")
+            _send_rgpd_notice(config, from_phone, nom_resto)
+        except Exception as e:
+            print(f"⚠️  [PROCESS] Notice RGPD échouée (non bloquant) : {e}")
 
     # ── Étape 2b : Parsing LLM (Gemini) → items JSONB ───────────────────────
     parsed_items = []
@@ -449,7 +552,40 @@ def _process_message(snack_id: str, from_phone: str, message_text: str, message_
 
 
 # =============================================================================
-# ROUTE 2 : GET /health — Health check
+# ROUTE 2 : POST /admin/gdpr/delete — Suppression RGPD (admin)
+# =============================================================================
+
+@app.route("/admin/gdpr/delete", methods=["POST"])
+def admin_gdpr_delete():
+    """
+    Endpoint admin RGPD : suppression manuelle des données d'un client (Art. 17).
+
+    Requiert : Authorization: Bearer <ADMIN_API_KEY>
+    Body JSON : { "phone_e164": "+33612345678", "snack_id": "uuid-du-snack" }
+    """
+    if not ADMIN_API_KEY:
+        return jsonify({"error": "Endpoint désactivé (ADMIN_API_KEY non configuré)"}), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or not hmac.compare_digest(
+        auth_header[7:], ADMIN_API_KEY
+    ):
+        _logger.warning("🚫 [ADMIN] Accès non autorisé /admin/gdpr/delete")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body     = request.get_json(silent=True) or {}
+    phone    = body.get("phone_e164", "").strip()
+    snack_id = body.get("snack_id",   "").strip()
+
+    if not phone or not snack_id:
+        return jsonify({"error": "phone_e164 et snack_id sont requis"}), 400
+
+    result = delete_customer_data(phone_e164=phone, snack_id=snack_id)
+    return jsonify(result), 200 if result.get("status") == "deleted" else 500
+
+
+# =============================================================================
+# ROUTE 3 : GET /health — Health check
 # =============================================================================
 
 @app.route("/health", methods=["GET"])
