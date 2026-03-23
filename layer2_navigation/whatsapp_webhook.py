@@ -1,22 +1,26 @@
 """
-Layer 2 — Navigation : WhatsApp Webhook (Snack-Flow v2.0 Full-WhatsApp)
-=======================================================================
-Point d'entrée unique du système.
+Layer 2 — Navigation : WhatsApp Webhook (SnackFlow v2.0 Full-WhatsApp)
+======================================================================
+Point d'entrée unique du système — api.menudirect.fr
 
 Reçoit les messages WhatsApp entrants depuis Meta Graph API (payload réel),
 parse le numéro expéditeur et le texte, puis orchestre de façon asynchrone :
-  1. upsert_customer()     → Supabase CRM
-  2. log_order()           → Supabase orders
+  1. upsert_customer()       → Supabase CRM
+  2. create_order()          → Supabase orders
   3. send_interactive_menu() → WhatsApp client (confirmation + menu)
   4. send_kitchen_ticket()   → WhatsApp snack (ticket cuisine)
 
-Architecture : Webhook Flask → thread asynchrone → Layer 3 Tools
+Architecture v2.0 — System User Token :
+  - Un seul token Meta (WHATSAPP_ACCESS_TOKEN) pour tous les tenants.
+  - Authentification tenant via metadata.phone_number_id → table snacks.
+  - phone_number_id inconnu → log NEW_ID_DETECTED + 200 (pas de retry Meta).
+
 Behavioral Rules :
   - Réponse 202 immédiate à Meta (< 500 ms)
   - Traitement complet en arrière-plan (< 3 s)
   - Self-Healing : si Supabase ou WhatsApp échoue → log + continue
-  - Formatage E.164 systématique (phone_tool)
-  - Zéro IVR, zéro SMS, zéro appel vocal
+  - Formatage E.164 systématique
+  - Zéro GSheets, zéro Twilio, zéro IVR, zéro SMS, zéro appel vocal
 """
 
 import hashlib
@@ -394,30 +398,37 @@ def whatsapp_webhook():
 
     # ── Authentification Multi-Tenant ────────────────────────────────────────
     # Chaque requête Meta porte metadata.phone_number_id.
-    # On vérifie en DB que ce phone_number_id correspond à un snack actif.
-    if phone_number_id:
-        snack_record = get_snack_by_phone_id(phone_number_id)
-        if not snack_record:
-            _logger.warning(
-                "🚫 [UNAUTHORIZED_SNACK] phone_number_id='%s' inconnu ou inactif — requête rejetée.",
-                phone_number_id,
-            )
-            return jsonify({"error": "Unauthorized — phone_number_id inconnu"}), 403
+    # On vérifie dans Supabase (table snacks) que l'ID correspond à un tenant actif.
+    if not phone_number_id:
+        # Aucun phone_number_id dans le payload → payload malformé, on ignore silencieusement
+        _logger.warning("⚠️  Payload reçu sans phone_number_id — ignoré.")
+        return jsonify({"status": "ignored", "reason": "missing phone_number_id"}), 200
 
-        # Snack authentifié : on préfère son UUID (schéma v3) ou snack_id legacy
-        snack_id = snack_record.get("id") or snack_record.get("snack_id") or DEFAULT_SNACK_ID
-        snack_name = snack_record.get("name") or snack_record.get("nom_resto", snack_id)
-        _logger.info(
-            "[ROUTING][SUCCESS] Message identifié pour le snack: %s", snack_name
+    snack_record = get_snack_by_phone_id(phone_number_id)
+
+    if not snack_record:
+        # ID inconnu : on logue pour faciliter l'onboarding, mais on répond 200
+        # pour éviter les retries Meta qui saturationnerait le webhook.
+        _logger.warning(
+            "🆕 [NEW_ID_DETECTED] phone_number_id='%s' inconnu dans Supabase. "
+            "Enregistrez ce snack via register_restaurant() pour l'activer.",
+            phone_number_id,
         )
-        print(
-            f"\n📲 Webhook [TENANT:{snack_name}] | phone_id={_redact(phone_number_id)} "
-            f"| from={_redact(from_phone)} | type={message_type} | msg='{message_text[:50]}'"
-        )
-    else:
-        # Aucun phone_number_id dans le payload → rejet strict
-        _logger.warning("🚫 Requête sans phone_number_id — rejetée.")
-        return jsonify({"error": "phone_number_id requis"}), 403
+        print(f"🆕 [NEW_ID_DETECTED] phone_number_id={phone_number_id}")
+        return jsonify({
+            "status": "ignored",
+            "reason": "NEW_ID_DETECTED",
+            "phone_number_id": phone_number_id,
+        }), 200
+
+    # Snack authentifié : UUID Supabase (schéma v3)
+    snack_id   = snack_record.get("id") or DEFAULT_SNACK_ID
+    snack_name = snack_record.get("name", snack_id)
+    _logger.info("[ROUTING][SUCCESS] Tenant identifié : %s", snack_name)
+    print(
+        f"\n📲 Webhook [TENANT:{snack_name}] | phone_id={_redact(phone_number_id)} "
+        f"| from={_redact(from_phone)} | type={message_type} | msg='{message_text[:50]}'"
+    )
 
     # Traitement asynchrone — réponse 202 immédiate à Meta
     _executor.submit(_process_message, snack_id, from_phone, message_text, message_type)

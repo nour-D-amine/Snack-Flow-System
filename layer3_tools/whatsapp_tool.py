@@ -1,28 +1,40 @@
 """
-whatsapp_tool.py — Snack-Flow WhatsApp Layer (Multi-Tenant)
-============================================================
+whatsapp_tool.py — Snack-Flow WhatsApp Layer (v2.0 Full-WhatsApp)
+=================================================================
 Intègre l'API Cloud officielle de Meta pour l'envoi de messages
-interactifs à boutons (CTA URL + phone_number).
+interactifs à boutons (CTA URL + text) et tickets cuisine.
+
+Architecture v2.0 — System User Token :
+  - Un SEUL token d'accès (System User Token du Business Manager Meta).
+  - Chargé depuis les variables d'environnement (WHATSAPP_ACCESS_TOKEN).
+  - Le `phone_number_id` est passé explicitement à chaque appel.
+  - Résultat : zéro dépendance à GSheets, zéro token par tenant.
 
 Principes :
-  - Zéro clé en dur : tout passe par l'argument `config` (dict GSheets).
+  - Zéro clé en dur : WHATSAPP_ACCESS_TOKEN et WHATSAPP_PHONE_NUMBER_ID
+    sont chargés depuis .env (fallback config dict pour compat legacy).
   - Self-Healing  : les erreurs API sont loguées sans faire planter le flux.
-  - Multi-Tenant  : chaque appel utilise le token + phone_id du tenant concerné.
+  - Multi-Tenant  : le phone_number_id du tenant est extrait du dict config.
   - Vitesse       : appels HTTP synchrones légers (< 1 s hors latence réseau).
 
 Fonctions publiques :
-  - send_interactive_menu(config, customer_phone)       → dict
-  - send_loyalty_welcome(config, customer_phone)        → dict
-  - send_kitchen_ticket(config, order_data)             → dict
-  - send_text_message(config, customer_phone, body)     → dict  [utilitaire interne]
+  - send_interactive_menu(config, customer_phone)   → dict
+  - send_loyalty_welcome(config, customer_phone)    → dict
+  - send_kitchen_ticket(config, order_data)         → dict
+  - send_text_message(config, customer_phone, body) → dict  [utilitaire interne]
 """
 
 import json
 import logging
+import os
 from datetime import datetime
-import requests
 
-# ─── Logger dédié (n'interfère pas avec le logger racine) ─────────────────────
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── Logger dédié ─────────────────────────────────────────────────────────────
 
 logger = logging.getLogger("snack_flow.whatsapp")
 if not logger.handlers:
@@ -31,7 +43,7 @@ if not logger.handlers:
     logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
-# ─── Constante versionnée ─────────────────────────────────────────────────────
+# ─── Constantes versionnées ───────────────────────────────────────────────────
 
 META_API_VERSION = "v19.0"
 META_GRAPH_BASE  = "https://graph.facebook.com"
@@ -41,30 +53,50 @@ META_GRAPH_BASE  = "https://graph.facebook.com"
 # HELPERS INTERNES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _validate_config(config: dict) -> tuple[str, str]:
+def _resolve_credentials(config: dict) -> tuple[str, str]:
     """
-    Extrait et valide les champs obligatoires du dictionnaire config.
+    Résout le phone_number_id et le System User Token pour un appel API.
 
-    :param config: Dict issu de get_snack_config() (GSheets).
-    :return:       (whatsapp_phone_id, whatsapp_token)
-    :raises ValueError: Si un champ obligatoire est absent ou vide.
+    Priorité :
+      1. config["whatsapp_phone_id"] ou config["whatsapp_phone_number_id"] (issu de Supabase)
+      2. Variable d'env WHATSAPP_PHONE_NUMBER_ID (fallback / single-tenant)
+
+    Le token suit TOUJOURS la même hiérarchie :
+      1. Variable d'env WHATSAPP_ACCESS_TOKEN (System User Token — recommandé)
+      2. config["whatsapp_token"] (legacy compat)
+
+    :param config: Dict de config issu de supabase_tool.get_snack_config().
+    :return: (phone_number_id, access_token)
+    :raises ValueError: Si l'un des deux est absent.
     """
-    phone_id = str(config.get("whatsapp_phone_id", "")).strip()
-    token    = str(config.get("whatsapp_token",    "")).strip()
-
+    # ── phone_number_id ──────────────────────────────────────────────────────
+    phone_id = (
+        str(config.get("whatsapp_phone_id", "")).strip()
+        or str(config.get("whatsapp_phone_number_id", "")).strip()
+        or os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    )
     if not phone_id:
         raise ValueError(
-            f"[{config.get('snack_id', '?')}] 'whatsapp_phone_id' manquant dans config."
+            f"[{config.get('snack_id') or config.get('id', '?')}] "
+            "'whatsapp_phone_number_id' introuvable dans config ni dans WHATSAPP_PHONE_NUMBER_ID."
         )
+
+    # ── access_token (System User Token) ─────────────────────────────────────
+    token = (
+        os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+        or str(config.get("whatsapp_token", "")).strip()
+    )
     if not token:
         raise ValueError(
-            f"[{config.get('snack_id', '?')}] 'whatsapp_token' manquant dans config."
+            "WHATSAPP_ACCESS_TOKEN absent des variables d'environnement. "
+            "Configurez un System User Token dans le Business Manager Meta."
         )
+
     return phone_id, token
 
 
 def _build_endpoint(phone_id: str) -> str:
-    """Construit l'URL de l'endpoint Messages pour un tenant donné."""
+    """Construit l'URL de l'endpoint Messages pour un phone_number_id donné."""
     return f"{META_GRAPH_BASE}/{META_API_VERSION}/{phone_id}/messages"
 
 
@@ -83,7 +115,7 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
             endpoint,
             headers=headers,
             data=json.dumps(payload),
-            timeout=8,  # garde-fou < 3 s dans le flux principal
+            timeout=8,
         )
         data = response.json()
 
@@ -117,39 +149,25 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
 
 def send_interactive_menu(config: dict, customer_phone: str) -> dict:
     """
-    Envoie un message WhatsApp interactif à deux boutons CTA :
-      - Bouton 1 : "Consulter le Menu 🍔"  → ouvre menu_url (type url)
-      - Bouton 2 : "Appeler le Snack 📞"   → compose le numéro du resto (type phone_number)
+    Envoie un message WhatsApp interactif CTA URL au client :
+      - Bouton : "Consulter le Menu 🍔" → ouvre menu_url
 
-    Le payload utilise le format `interactive > cta_url` et `interactive > button`
-    conformes à l'API Cloud de Meta (v19.0).
+    Le token est résolu depuis WHATSAPP_ACCESS_TOKEN (System User Token).
+    Le phone_number_id est résolu depuis config ou WHATSAPP_PHONE_NUMBER_ID.
 
-    :param config:         Dict complet issu de get_snack_config().
-                           Champs requis : whatsapp_phone_id, whatsapp_token,
-                                          menu_url, nom_resto, snack_id.
+    :param config:         Dict issu de supabase_tool.get_snack_config().
+                           Champs utilisés : whatsapp_phone_number_id, menu_url, name.
     :param customer_phone: Numéro du client au format E.164 (ex: "+33785557054").
     :return:               Réponse JSON de Meta ou dict d'erreur.
     """
-    phone_id, token = _validate_config(config)
+    phone_id, token = _resolve_credentials(config)
 
-    menu_url   = str(config.get("menu_url",   "")).strip()
-    nom_resto  = str(config.get("nom_resto",  "Notre Snack")).strip()
-    snack_id   = str(config.get("snack_id",   "")).strip()
-    # Numéro du resto : on extrait depuis config
-    resto_phone = str(config.get("resto_phone", "")).strip()
+    menu_url  = str(config.get("menu_url", "")).strip()
+    nom_resto = str(config.get("nom_resto") or config.get("name", "Notre Snack")).strip()
+    snack_id  = str(config.get("snack_id") or config.get("id", "")).strip()
 
     if not menu_url:
-        logger.warning("menu_url absent pour %s — bouton Menu désactivé.", config.get("snack_id"))
-
-    # ── Corps du message interactif ──────────────────────────────────────────
-    # Meta supporte deux types CTA : url et phone_number.
-    # On utilise le type `cta_url` pour le bouton menu
-    # et un deuxième message `phone_number` si le numéro resto est disponible.
-    #
-    # ⚠️  L'API Cloud Meta ne supporte pas de mixer url + phone_number dans
-    #     un seul bloc `buttons`. On envoie donc un message de type `cta_url`
-    #     (bouton URL) enrichi d'un footer avec le numéro, puis un second bouton
-    #     `reply` invitant à appeler — pattern recommandé par Meta pour les PME.
+        logger.warning("menu_url absent pour snack '%s' — lien de fallback utilisé.", snack_id)
 
     payload = {
         "messaging_product": "whatsapp",
@@ -165,55 +183,24 @@ def send_interactive_menu(config: dict, customer_phone: str) -> dict:
             "body": {
                 "text": (
                     "Bonjour ! 👋\n"
-                    "Commandez facilement en ligne ou contactez-nous directement."
+                    "Votre commande a bien été reçue. "
+                    "Consultez notre menu pour personnaliser votre choix."
                 ),
             },
             "footer": {
-                "text": f"📞 {resto_phone}" if resto_phone else "Snack-Flow • Commande rapide",
+                "text": "SnackFlow • Commande rapide via WhatsApp",
             },
             "action": {
                 "name": "cta_url",
                 "parameters": {
                     "display_text": "Consulter le Menu 🍔",
-                    "url": menu_url or "https://snackflow.app",
+                    "url": menu_url or "https://le-menu.app",
                 },
             },
         },
     }
 
-    result = _post(_build_endpoint(phone_id), token, payload)
-
-    # ── Second message : bouton "Appeler" si numéro disponible ───────────────
-    if resto_phone and "error" not in result:
-        call_payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type":    "individual",
-            "to":                customer_phone,
-            "type":              "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {
-                    "text": "Vous préférez parler à quelqu'un ? 🤙",
-                },
-                "action": {
-                    "buttons": [
-                        {
-                            "type":  "reply",
-                            "reply": {
-                                "id":    f"{snack_id}|call_resto",
-                                "title": "Appeler le Snack 📞",
-                            },
-                        }
-                    ]
-                },
-                "footer": {
-                    "text": resto_phone,
-                },
-            },
-        }
-        _post(_build_endpoint(phone_id), token, call_payload)
-
-    return result
+    return _post(_build_endpoint(phone_id), token, payload)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -222,17 +209,17 @@ def send_interactive_menu(config: dict, customer_phone: str) -> dict:
 
 def send_loyalty_welcome(config: dict, customer_phone: str) -> dict:
     """
-    Envoie un message de bienvenue personnalisé aux clients LOYAL.
-    Ce message est déclenché lorsque check_customer_loyalty() retourne "LOYAL".
+    Envoie un message de bienvenue personnalisé aux clients fidèles.
+    Déclenché lorsque total_orders >= loyalty_threshold.
 
-    :param config:         Dict complet issu de get_snack_config().
+    :param config:         Dict issu de supabase_tool.get_snack_config().
     :param customer_phone: Numéro du client au format E.164.
     :return:               Réponse JSON de Meta ou dict d'erreur.
     """
-    phone_id, token = _validate_config(config)
+    phone_id, token = _resolve_credentials(config)
 
-    nom_resto  = str(config.get("nom_resto", "votre snack préféré")).strip()
-    menu_url   = str(config.get("menu_url",  "")).strip()
+    nom_resto = str(config.get("nom_resto") or config.get("name", "votre snack préféré")).strip()
+    menu_url  = str(config.get("menu_url", "")).strip()
 
     payload = {
         "messaging_product": "whatsapp",
@@ -253,13 +240,13 @@ def send_loyalty_welcome(config: dict, customer_phone: str) -> dict:
                 ),
             },
             "footer": {
-                "text": "Snack-Flow • Programme Fidélité",
+                "text": "SnackFlow • Programme Fidélité",
             },
             "action": {
                 "name": "cta_url",
                 "parameters": {
                     "display_text": "Accéder à mon menu 🍔",
-                    "url": menu_url or "https://snackflow.app",
+                    "url": menu_url or "https://le-menu.app",
                 },
             },
         },
@@ -269,20 +256,19 @@ def send_loyalty_welcome(config: dict, customer_phone: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. MESSAGE TEXTE SIMPLE — UTILITAIRE (fallback / alertes internes)
+# 3. MESSAGE TEXTE SIMPLE — UTILITAIRE (fallback / alertes / RGPD)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def send_text_message(config: dict, customer_phone: str, body: str) -> dict:
     """
-    Envoie un message texte simple (fallback ou alerte interne).
-    Utilisé notamment pour les notifications d'échec vers le restaurateur.
+    Envoie un message texte simple (fallback, alertes, notices RGPD).
 
-    :param config:         Dict complet issu de get_snack_config().
+    :param config:         Dict issu de supabase_tool.get_snack_config().
     :param customer_phone: Destinataire au format E.164.
-    :param body:           Texte du message.
+    :param body:           Texte du message (supporte le Markdown WhatsApp : *gras*, _italique_).
     :return:               Réponse JSON de Meta ou dict d'erreur.
     """
-    phone_id, token = _validate_config(config)
+    phone_id, token = _resolve_credentials(config)
 
     payload = {
         "messaging_product": "whatsapp",
@@ -306,66 +292,41 @@ def send_kitchen_ticket(config: dict, order_data: dict) -> dict:
     """
     Envoie un ticket de commande formaté au restaurateur via WhatsApp.
 
-    Le destinataire est le numéro du restaurateur lui-même (resto_phone dans
-    config), PAS le client. Ce message sert de bon de commande cuisine.
+    Le destinataire est le numéro du restaurateur (resto_phone dans config).
+    Ce message sert de bon de commande cuisine.
 
     Structure attendue de order_data ::
 
         {
             "customer_phone": "+33785557054",
             "items": [
-                {
-                    "name":     "Burger Montagnard",
-                    "quantity": 1,
-                    "options":  ["Sauce Algérienne"]   # optionnel
-                },
-                {
-                    "name":     "Frites Maison",
-                    "quantity": 1
-                }
+                {"name": "Burger Montagnard", "qty": 2, "options": ["Sauce Algérienne"]},
+                {"name": "Frites Maison",     "qty": 1}
             ],
-            "total":   18.50,       # float ou str
-            "notes":   "Sans oignons"  # optionnel
+            "total": "18.50",   # float ou str
+            "notes": "Sans oignons"  # optionnel
         }
 
-    Format de sortie WhatsApp ::
-
-        📟 *NOUVELLE COMMANDE*
-        ▬▬▬▬▬▬▬▬▬▬
-        👤 *Client :* +33785557054
-        🍔 *Détails :*
-        • 1x Burger Montagnard
-          ↳ Sauce Algérienne
-        • 1x Frites Maison
-        • 1x Coca-Cola 33cl
-
-        💰 Total : 18.50€
-        ▬▬▬▬▬▬▬▬▬▬
-        🕒 Heure : 14:10
-
-    :param config:     Dict complet issu de get_snack_config().
-                       Champs requis : whatsapp_phone_id, whatsapp_token.
-                       Champ utilisé comme destinataire : resto_phone.
-    :param order_data: Dict structuré de la commande (voir ci-dessus).
+    :param config:     Dict issu de supabase_tool.get_snack_config().
+                       Champ destinataire : resto_phone.
+    :param order_data: Dict structuré de la commande.
     :return:           Réponse JSON de Meta ou dict d'erreur.
-    :raises ValueError: Si 'items' ou 'total' sont absents de order_data.
     """
-    # ── Validation des champs obligatoires de order_data ────────────────────
     if "items" not in order_data or not isinstance(order_data["items"], list):
         raise ValueError("order_data doit contenir une clé 'items' de type list.")
     if "total" not in order_data:
         raise ValueError("order_data doit contenir une clé 'total'.")
 
-    # ── Destinataire : le restaurateur lui-même ──────────────────────────────
+    # ── Destinataire : le restaurateur ───────────────────────────────────────
     resto_phone = str(config.get("resto_phone", "")).strip()
     if not resto_phone:
         logger.error(
             "[%s] 'resto_phone' absent dans config — ticket cuisine non envoyé.",
-            config.get("snack_id", "?"),
+            config.get("snack_id") or config.get("id", "?"),
         )
         return {"error": "resto_phone manquant dans config", "status": "not_sent"}
 
-    # ── Formatage du corps du ticket ─────────────────────────────────────────
+    # ── Formatage du ticket ───────────────────────────────────────────────────
     customer_phone = str(order_data.get("customer_phone", "Inconnu")).strip()
     items          = order_data["items"]
     total          = order_data["total"]
@@ -373,42 +334,29 @@ def send_kitchen_ticket(config: dict, order_data: dict) -> dict:
     heure          = datetime.now().strftime("%H:%M")
     separateur     = "▬" * 10
 
-    # Construction des lignes d'articles
     lignes_items = []
     for item in items:
-        name     = str(item.get("name",     "Article")).strip()
-        quantity = str(item.get("quantity", 1)).strip()
+        name     = str(item.get("name", "Article")).strip()
+        qty      = str(item.get("qty", item.get("quantity", 1))).strip()
         options  = item.get("options", [])
-
-        ligne = f"• {quantity}x {name}"
-        lignes_items.append(ligne)
-
-        # Options en retrait (une par ligne)
+        lignes_items.append(f"• {qty}x {name}")
         for opt in options:
             lignes_items.append(f"  ↳ {opt}")
 
-    details_str = "\n".join(lignes_items)
-
-    # Corps principal
     body_lines = [
-        f"📟 *NOUVELLE COMMANDE*",
+        "📟 *NOUVELLE COMMANDE*",
         separateur,
         f"👤 *Client :* {customer_phone}",
-        f"🍔 *Détails :*",
-        details_str,
+        "🍔 *Détails :*",
+        "\n".join(lignes_items),
         "",
         f"💰 Total : {total}€",
     ]
 
-    # Section notes (facultative)
     if notes:
-        body_lines.append("")
-        body_lines.append(f"📝 *Notes :* {notes}")
+        body_lines += ["", f"📝 *Notes :* {notes}"]
 
-    body_lines += [
-        separateur,
-        f"🕒 Heure : {heure}",
-    ]
+    body_lines += [separateur, f"🕒 Heure : {heure}"]
 
     ticket_body = "\n".join(body_lines)
 
@@ -417,7 +365,6 @@ def send_kitchen_ticket(config: dict, order_data: dict) -> dict:
         resto_phone, customer_phone, total,
     )
 
-    # ── Envoi via send_text_message (réutilise _post + gestion erreurs) ──────
     return send_text_message(config, resto_phone, ticket_body)
 
 
@@ -429,18 +376,18 @@ if __name__ == "__main__":
     import json as _json
 
     print("=" * 60)
-    print("   Snack-Flow — WhatsApp Tool Multi-Tenant — Self-Test")
+    print("   SnackFlow — WhatsApp Tool v2.0 — Self-Test")
+    print("   (System User Token depuis .env)")
     print("=" * 60)
 
-    # Config de test simulée (normalement issue de get_snack_config())
+    # Config de test simulée (normalement issue de supabase_tool.get_snack_config())
     MOCK_CONFIG = {
-        "snack_id":            "SNACK_TEST_01",
-        "nom_resto":           "Le Snack du Coin",
-        "whatsapp_phone_id":   "VOTRE_PHONE_NUMBER_ID",   # ← à remplacer
-        "whatsapp_token":      "VOTRE_ACCESS_TOKEN",       # ← à remplacer
-        "menu_url":            "https://snackflow.app/menu/snack-test-01",
-        "resto_phone":         "+33600000000",
-        "loyalty_threshold":   3,
+        "id":                        "uuid-snack-test-01",
+        "name":                      "Le Snack du Coin",
+        "whatsapp_phone_number_id":  os.getenv("WHATSAPP_PHONE_NUMBER_ID", "VOTRE_PHONE_NUMBER_ID"),
+        "menu_url":                  "https://le-menu.app/snack-du-coin",
+        "resto_phone":               "+33600000000",
+        "loyalty_threshold":         5,
     }
 
     TEST_CUSTOMER = "+33785557054"   # ← à remplacer par un vrai numéro de test
@@ -449,13 +396,9 @@ if __name__ == "__main__":
     r1 = send_interactive_menu(MOCK_CONFIG, TEST_CUSTOMER)
     print("   →", _json.dumps(r1, indent=4, ensure_ascii=False))
 
-    print(f"\n[2] Envoi du message fidélité à {TEST_CUSTOMER}...")
-    r2 = send_loyalty_welcome(MOCK_CONFIG, TEST_CUSTOMER)
+    print(f"\n[2] Envoi d'un message texte simple (fallback)...")
+    r2 = send_text_message(MOCK_CONFIG, TEST_CUSTOMER, "⚠️ Test fallback SnackFlow v2.0.")
     print("   →", _json.dumps(r2, indent=4, ensure_ascii=False))
-
-    print(f"\n[3] Envoi d'un message texte simple (fallback)...")
-    r3 = send_text_message(MOCK_CONFIG, TEST_CUSTOMER, "⚠️ Test fallback Snack-Flow.")
-    print("   →", _json.dumps(r3, indent=4, ensure_ascii=False))
 
     print("\n" + "=" * 60)
     print("   ✅ Self-Test terminé")
