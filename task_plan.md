@@ -1,29 +1,38 @@
-# Task Plan
+# SnackFlow (api.menudirect.fr) - Project Task Plan
 
-## Phase 1: Blueprint (Vision & Logic)
-- [x] Define the North Star
-- [x] Identify Integrations
-- [x] Source of Truth
-- [x] Delivery Payload
-- [x] Behavioral Rules
+## Current Status
+- **Pivot Stratégique Effectué** : Transition vers une architecture "100% WhatsApp" (Full-WhatsApp v2.0).
+- **Objectif** : Transformer chaque message WhatsApp entrant en une commande confirmée, traitée et routée instantanément, avec zéro friction et sans usage de téléphonie, de Twilio ou d'IVR.
 
-## Phase 2: Links (Connections)
-- [x] Configure connections (via Python Native instead of MCP)
-- [x] Perform verification handshakes (Google Sheets)
-- [x] Store environment variables securely
+## Completed Tasks
 
-## Phase 3: Architect (The Engine)
-- [x] Layer 3 (Tools) : gsheets_tool, twilio_tool, whatsapp_tool, phone_tool
-- [x] Layer 2 (Navigation) : ivr_flow.py — Flux IVR Flask (webhooks Twilio)
-- [x] Layer 1 (SOPs) : orchestrator.py — SOP-001 à SOP-005 (démarrage, health, shutdown)
+### Phase 1: Blueprint & Architecture
+- [x] Définition de la North Star (100% WhatsApp via Meta API, traitement < 3s).
+- [x] Architecture : Layer 1 (SOPs), Layer 2 (Webhook Meta), Layer 3 (Outils).
+- [x] Suppression complète des dépendances : Twilio, flux IVR, appels téléphoniques, SMS, phone_tool.py.
+- [x] Pivot vers **Supabase** comme point de vérité unique (snacks, orders, customers).
 
-## Phase 4: Stylization (UI/UX)
-- [ ] Refine formatting des messages SMS et WhatsApp
-- [ ] Dashboard optionnel (si requis)
+### Phase 2: Infrastructure & Déploiement
+- [x] **Configuration DNS Hostinger** : Validation des enregistrements pour le domaine `api.menudirect.fr`.
+- [x] **SSL Railway** : Génération et activation du certificat TLS/SSL.
+- [x] **Liaison du domaine** : Configuration du routage avec `api.menudirect.fr` sur l'environnement Railway.
+- [x] Sécurisation des variables d'environnement initiales.
 
-## Phase 5: Trigger (Deployment)
-- [ ] Compléter les variables .env manquantes (TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, RESTAURANT_WHATSAPP_NUMBER)
-- [ ] Exposer le webhook (ngrok en dev, ou déploiement cloud en prod)
-- [ ] Configurer le numéro Twilio pour pointer sur /incoming
-- [ ] Test end-to-end complet (appel → IVR → SMS → WhatsApp → Google Sheets)
-- [ ] Final security compliance audit
+### Phase 3: Core Logic (The Engine)
+- [x] Layer 3 (Tools) : `supabase_tool.py`, `whatsapp_tool.py`, `gemini_tool.py`.
+- [x] Layer 2 (Navigation) : Création de `whatsapp_webhook.py` (remplacement intégral de l'IVR).
+- [x] Layer 1 (SOPs) : Modernisation de `orchestrator.py`.
+
+## Next Steps
+
+### Phase 4: Stylization (UI/UX)
+- [ ] Affinage du formatage des messages interactifs WhatsApp (Menu avec boutons).
+- [ ] Optimisation de la structure et du rendu visuel du "ticket cuisine" WhatsApp reçu par le restaurant.
+
+### Phase 5: Trigger & Launch
+- [ ] Configuration stricte des variables d'environnement critiques en production (`WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_PHONE_NUMBER_ID`).
+- [ ] **Validation du Webhook** dans le dashboard Meta Developers (via le endpoint sécurisé `https://api.menudirect.fr/webhook`).
+- [ ] **Abonnement de Webhook** : Souscrire explicitement au champ `messages` dans la configuration WhatsApp Cloud API de Meta.
+- [ ] Tests de bout en bout de la réception de commande.
+- [ ] Tests de parsing de texte avec **Gemini** (détection et extraction fiable des items de la commande).
+- [ ] Audit final de sécurité (Vérifications des signatures Meta X-Hub-Signature-256) et conformité (RGPD).
