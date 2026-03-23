@@ -158,9 +158,18 @@ def get_snack_config(snack_id: str) -> dict:
         config["whatsapp_token"]    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
         if not config["whatsapp_token"]:
             logger.warning("⚠️  get_snack_config : WHATSAPP_ACCESS_TOKEN non configuré !")
-        config["menu_url"]          = os.getenv("MENU_URL", "https://le-menu.app")
-        config["loyalty_threshold"] = 3
-        config["resto_phone"]       = os.getenv("RESTO_PHONE", "+33600000000")
+        # menu_url : colonne Supabase en priorité, fallback env var
+        config["menu_url"]          = (
+            config.get("menu_url")
+            or os.getenv("MENU_URL", "https://le-menu.app")
+        )
+        # loyalty_threshold : colonne Supabase en priorité, fallback 5
+        config["loyalty_threshold"] = config.get("loyalty_threshold") or 5
+        # resto_phone : colonne Supabase en priorité, fallback env var
+        config["resto_phone"]       = (
+            config.get("resto_phone")
+            or os.getenv("RESTO_PHONE", "")
+        )
         return config
 
     try:
@@ -347,13 +356,23 @@ def upsert_snack(
             "whatsapp_phone_number_id": resolved_phone_id,
             "is_active":                is_active,
         }
+        # Persistance des colonnes étendues (désormais présentes dans le schéma v2.0)
+        if menu_url:
+            data["menu_url"] = menu_url
+        if loyalty_threshold and loyalty_threshold != 5:
+            data["loyalty_threshold"] = loyalty_threshold
+        elif "loyalty_threshold" not in data:
+            data["loyalty_threshold"] = 5
+        if resto_phone:
+            data["resto_phone"] = resto_phone
+
         response = (
             sb.table(TABLE_SNACKS)
             .upsert(data, on_conflict="whatsapp_phone_number_id")
             .execute()
         )
         result = response.data[0] if response.data else data
-        logger.info("✅ Snack upsert v3 : '%s' | phone_id=%s", resolved_name, resolved_phone_id)
+        logger.info("✅ Snack upsert v2 : '%s' | phone_id=%s", resolved_name, resolved_phone_id)
         return result
     except Exception as e:
         logger.error("❌ upsert_snack('%s') : %s", resolved_name, e)
