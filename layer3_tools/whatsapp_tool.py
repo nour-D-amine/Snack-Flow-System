@@ -285,7 +285,63 @@ def send_text_message(config: dict, customer_phone: str, body: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. TICKET CUISINE — NOTIFICATION RESTAURATEUR
+# 4. BOUTONS INTERACTIFS — VALIDATION GÉRANT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def send_interactive_buttons(
+    config: dict,
+    recipient_phone: str,
+    body_text: str,
+    buttons: list,
+    header_text: str = "",
+    footer_text: str = "",
+) -> dict:
+    """
+    Envoie un message WhatsApp interactif à boutons quick_reply (max 3).
+
+    :param config:          Dict issu de supabase_tool.get_snack_config().
+    :param recipient_phone: Destinataire au format E.164.
+    :param body_text:       Corps du message (texte principal).
+    :param buttons:         Liste de dicts [{"id": "CONFIRM_<uuid>", "title": "✅ Valider"}, ...].
+                            Max 3 boutons. Titres limités à 20 caractères (contrainte Meta).
+    :param header_text:     (optionnel) Texte d'en-tête.
+    :param footer_text:     (optionnel) Texte de pied de message.
+    :return:                Réponse JSON de Meta ou dict d'erreur.
+    """
+    phone_id, token = _resolve_credentials(config)
+
+    if not buttons or len(buttons) > 3:
+        logger.error("send_interactive_buttons : 1 à 3 boutons requis (reçu %d).", len(buttons))
+        return {"error": "invalid_buttons_count"}
+
+    formatted_buttons = [
+        {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"][:20]}}
+        for btn in buttons
+    ]
+
+    interactive: dict = {
+        "type": "button",
+        "body": {"text": body_text},
+        "action": {"buttons": formatted_buttons},
+    }
+    if header_text:
+        interactive["header"] = {"type": "text", "text": header_text}
+    if footer_text:
+        interactive["footer"] = {"text": footer_text}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type":    "individual",
+        "to":                recipient_phone,
+        "type":              "interactive",
+        "interactive":       interactive,
+    }
+
+    return _post(_build_endpoint(phone_id), token, payload)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. TICKET CUISINE — NOTIFICATION RESTAURATEUR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def send_kitchen_ticket(config: dict, order_data: dict) -> dict:

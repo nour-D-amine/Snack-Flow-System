@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from layer3_tools.phone_tool import safe_normalize
 from layer3_tools.whatsapp_tool import (
     send_interactive_menu,
-    send_kitchen_ticket,
+    send_interactive_buttons,
     send_text_message,
 )
 from layer3_tools.supabase_tool import (
@@ -54,9 +54,11 @@ from layer3_tools.supabase_tool import (
     delete_customer_data,
     create_order,
     update_order_status,
+    get_order_by_id,
     health_check as supabase_health,
 )
 from layer3_tools.gemini_tool import parse_order_text
+from layer3_tools.hubrise_tool import push_to_hubrise
 
 load_dotenv()
 
@@ -276,13 +278,16 @@ def _parse_whatsapp_payload(data: dict) -> Optional[dict]:
         message_type = msg.get("type", "text")       # "text" | "interactive" | "image"...
         message_text = ""
 
+        button_id = ""
         if message_type == "text":
             message_text = msg.get("text", {}).get("body", "").strip()
         elif message_type == "interactive":
             # Bouton reply ou list reply
             interactive = msg.get("interactive", {})
             if interactive.get("type") == "button_reply":
-                message_text = interactive.get("button_reply", {}).get("title", "")
+                button_reply = interactive.get("button_reply", {})
+                message_text = button_reply.get("title", "")
+                button_id    = button_reply.get("id", "")
             elif interactive.get("type") == "list_reply":
                 message_text = interactive.get("list_reply", {}).get("title", "")
         else:
@@ -301,6 +306,7 @@ def _parse_whatsapp_payload(data: dict) -> Optional[dict]:
             "message_text":    _sanitize(message_text, max_len=1024),
             "message_type":    message_type,
             "phone_number_id": phone_number_id,
+            "button_id":       button_id,
         }
 
     except Exception as e:
@@ -395,6 +401,7 @@ def whatsapp_webhook():
     message_text    = parsed["message_text"]
     message_type    = parsed["message_type"]
     phone_number_id = parsed.get("phone_number_id", "")
+    button_id       = parsed.get("button_id", "")
 
     # ── Authentification Multi-Tenant ────────────────────────────────────────
     # Chaque requête Meta porte metadata.phone_number_id.
@@ -431,7 +438,7 @@ def whatsapp_webhook():
     )
 
     # Traitement asynchrone — réponse 202 immédiate à Meta
-    _executor.submit(_process_message, snack_id, from_phone, message_text, message_type)
+    _executor.submit(_process_message, snack_id, from_phone, message_text, message_type, button_id)
 
     return jsonify({"status": "accepted"}), 202
 
@@ -440,126 +447,217 @@ def whatsapp_webhook():
 # TRAITEMENT ASYNCHRONE — Orchestration principale
 # =============================================================================
 
-def _process_message(snack_id: str, from_phone: str, message_text: str, message_type: str):
+def _process_message(
+    snack_id: str,
+    from_phone: str,
+    message_text: str,
+    message_type: str,
+    button_id: str = "",
+):
     """
-    Orchestre le traitement complet d'un message WhatsApp entrant :
-      1. Chargement config restaurant (Supabase)
-      2. Upsert customer CRM (Supabase)
-      3. Log de la commande (Supabase)
-      4. Vérification fidélité
-      5. Envoi confirmation WhatsApp → client
-      6. Envoi ticket cuisine WhatsApp → snack
-      7. Log interaction (Supabase)
+    Point d'entrée du traitement asynchrone.
+    Route vers :
+      - _handle_manager_callback() si le message vient du gérant et porte un button_id de validation
+      - _process_new_order() pour toute autre commande client
     """
-    print(f"\n🔄 [PROCESS] Démarrage | {snack_id} | {_redact(from_phone)}")
-    start_time = time.time()
-
-    # ── Étape 1 : Config restaurant ──────────────────────────────────────────
     config = _load_config(snack_id)
     if not config:
         print(f"❌ [PROCESS] Config snack '{snack_id}' introuvable — abandon.")
         return
 
-    wa_status = "Échec"
+    resto_phone = str(config.get("resto_phone", "")).strip()
+    _MANAGER_PREFIXES = ("CONFIRM_", "REJECT_", "CALL_")
+
+    if (
+        button_id
+        and resto_phone
+        and from_phone == resto_phone
+        and any(button_id.startswith(p) for p in _MANAGER_PREFIXES)
+    ):
+        _handle_manager_callback(button_id, from_phone, config, snack_id)
+    else:
+        _process_new_order(snack_id, from_phone, message_text, message_type, config)
+
+
+def _handle_manager_callback(
+    button_id: str,
+    manager_phone: str,
+    config: dict,
+    snack_id: str,
+):
+    """
+    Traite la réponse du gérant à un bouton de validation.
+
+    button_id format : "<ACTION>_<order_uuid>"
+      - CONFIRM_<uuid> → confirme + push HubRise + notifie client
+      - REJECT_<uuid>  → annule + notifie client
+      - CALL_<uuid>    → envoie le lien d'appel au gérant (wa.me)
+    """
+    try:
+        action, order_id = button_id.split("_", 1)
+    except ValueError:
+        print(f"⚠️  [CALLBACK] button_id malformé : '{button_id}'")
+        return
+
+    print(f"\n🎛️  [CALLBACK] action={action} | order_id={order_id} | gérant={_redact(manager_phone)}")
+
+    order = get_order_by_id(order_id, snack_id)
+    if not order:
+        print(f"❌ [CALLBACK] Commande introuvable : {order_id}")
+        send_text_message(config, manager_phone, f"❌ Commande introuvable (id: {order_id[:8]}…)")
+        return
+
+    customer_phone = order.get("customer_phone", "")
+    items          = order.get("items", [])
+    nom_resto      = config.get("nom_resto") or config.get("name", "Le Snack")
+
+    if action == "CONFIRM":
+        # Mise à jour Supabase
+        update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
+        # Push HubRise
+        hubrise_result = push_to_hubrise(order, config)
+        hubrise_ok     = "error" not in hubrise_result and not hubrise_result.get("skipped")
+        # Notification client
+        items_txt = "\n".join(
+            f"  • {it.get('qty', 1)}x {it.get('name', '?')}" for it in items
+        )
+        send_text_message(
+            config, customer_phone,
+            f"✅ *Votre commande est confirmée !*\n\n{items_txt}\n\n"
+            f"Merci de votre confiance chez _{nom_resto}_ 🙏",
+        )
+        print(f"✅ [CALLBACK] CONFIRM | order={order_id[:8]} | HubRise={'ok' if hubrise_ok else 'skipped/err'}")
+
+    elif action == "REJECT":
+        update_order_status(order_id=order_id, status="cancelled", snack_id=snack_id)
+        send_text_message(
+            config, customer_phone,
+            f"😔 Désolé, votre commande n'a pas pu être traitée par _{nom_resto}_.\n"
+            "N'hésitez pas à recommander ou à nous appeler directement.",
+        )
+        print(f"✅ [CALLBACK] REJECT | order={order_id[:8]}")
+
+    elif action == "CALL":
+        phone_link = customer_phone.lstrip("+")
+        send_text_message(
+            config, manager_phone,
+            f"📞 *Appeler le client :*\n{customer_phone}\n\n"
+            f"Lien direct : wa.me/{phone_link}\nTel : tel:{customer_phone}",
+        )
+        print(f"✅ [CALLBACK] CALL | order={order_id[:8]} | client={_redact(customer_phone)}")
+
+    else:
+        print(f"⚠️  [CALLBACK] Action inconnue : '{action}'")
+
+
+def _process_new_order(
+    snack_id: str,
+    from_phone: str,
+    message_text: str,
+    message_type: str,
+    config: dict,
+):
+    """
+    Orchestre le traitement complet d'une nouvelle commande client :
+      1. Détection RGPD
+      2. Upsert customer CRM
+      3. Notice RGPD Art. 13 (premier contact)
+      4. Parsing LLM Gemini → items JSONB
+      5. Création commande Supabase (status=pending)
+      6. Confirmation WhatsApp → client (menu CTA)
+      7. Boutons de validation → gérant (CONFIRM / REJECT / CALL)
+    """
+    print(f"\n🔄 [ORDER] Démarrage | {snack_id} | {_redact(from_phone)}")
+    start_time = time.time()
 
     # ── Détection demande RGPD (effacement Art. 17) ──────────────────────────
     if message_type == "text" and _is_deletion_request(message_text):
         _handle_deletion_request(config, snack_id, from_phone)
         return
 
-    # ── Étape 2 : Upsert customer CRM ────────────────────────────────────────
+    # ── Étape 1 : Upsert customer CRM ────────────────────────────────────────
     is_new_customer = False
     try:
         customer_data   = upsert_customer(phone_e164=from_phone, snack_id=snack_id)
         is_new_customer = isinstance(customer_data, dict) and customer_data.get("total_orders", 0) == 1
-        print(f"✅ [PROCESS] Customer CRM upserted : {_redact(from_phone)} | nouveau={is_new_customer}")
+        print(f"✅ [ORDER] Customer CRM upserted | nouveau={is_new_customer}")
     except Exception as e:
-        print(f"⚠️  [PROCESS] upsert_customer échoué (non bloquant) : {e}")
+        print(f"⚠️  [ORDER] upsert_customer échoué (non bloquant) : {e}")
 
-    # ── Étape 2a : Notice RGPD Art. 13 au premier contact ────────────────────
     if is_new_customer:
         try:
             nom_resto = config.get("nom_resto") or config.get("name", "Notre Snack")
             _send_rgpd_notice(config, from_phone, nom_resto)
         except Exception as e:
-            print(f"⚠️  [PROCESS] Notice RGPD échouée (non bloquant) : {e}")
+            print(f"⚠️  [ORDER] Notice RGPD échouée (non bloquant) : {e}")
 
-    # ── Étape 2b : Parsing LLM (Gemini) → items JSONB ───────────────────────
+    # ── Étape 2 : Parsing LLM (Gemini) → items JSONB ────────────────────────
     parsed_items = []
     if message_type == "text" and message_text:
         try:
             parsed_items = parse_order_text(message_text)
-            if parsed_items:
-                print(
-                    f"✅ [PROCESS] Gemini parser : {len(parsed_items)} article(s) → "
-                    f"{parsed_items}"
-                )
-            else:
-                print("ℹ️  [PROCESS] Gemini : aucun article détecté dans le message")
+            print(f"✅ [ORDER] Gemini : {len(parsed_items)} article(s) → {parsed_items}")
         except Exception as e:
-            print(f"⚠️  [PROCESS] Gemini parse échoué : {e}")
+            print(f"⚠️  [ORDER] Gemini parse échoué : {e}")
 
-    # ── Étape 3 : Création de la commande (INSERT unique avec status=pending) ─
+    # ── Étape 3 : Création commande (status=pending) ─────────────────────────
     order_id: Optional[str] = None
     try:
         order_result = create_order(
             snack_id=snack_id,
             data={
                 "customer_phone": from_phone,
-                "items": parsed_items if parsed_items else [
-                    {"name": message_text or f"[{message_type}]", "qty": 1}
-                ],
+                "items": parsed_items or [{"name": message_text or f"[{message_type}]", "qty": 1}],
                 "status": "pending",
             },
         )
         order_id = order_result.get("row", {}).get("id")
-        print(f"✅ [PROCESS] Order créée dans Supabase (id={order_id})")
+        print(f"✅ [ORDER] Commande créée (id={order_id})")
     except Exception as e:
-        print(f"⚠️  [PROCESS] create_order échoué : {e}")
+        print(f"⚠️  [ORDER] create_order échoué : {e}")
 
     # ── Étape 4 : Confirmation WhatsApp → Client ──────────────────────────────
     try:
         wa_result = send_interactive_menu(config, from_phone)
-
         if "error" not in wa_result:
-            wa_status = "Envoyé"
-            print(f"✅ [PROCESS] Menu WA envoyé → {_redact(from_phone)}")
+            print(f"✅ [ORDER] Menu WA envoyé → {_redact(from_phone)}")
         else:
-            print(f"❌ [PROCESS] Échec envoi menu WA : {wa_result.get('error')}")
+            print(f"❌ [ORDER] Échec envoi menu WA : {wa_result.get('error')}")
     except Exception as e:
-        print(f"❌ [PROCESS] Erreur critique envoi WA client : {e}")
+        print(f"❌ [ORDER] Erreur envoi WA client : {e}")
 
-    # ── Étape 6 : Ticket Cuisine → Snack ─────────────────────────────────────
-    try:
-        ticket_data = {
-            "customer_phone": from_phone,
-            # Use Gemini-parsed items when available; fall back to raw text
-            "items":  parsed_items if parsed_items else [
-                {"name": message_text or "Commande WhatsApp", "qty": 1}
-            ],
-            "total":  "—",
-        }
-        ticket_result = send_kitchen_ticket(config, ticket_data)
-        if "error" not in ticket_result:
-            print(f"✅ [PROCESS] Ticket cuisine envoyé au snack")
-        else:
-            print(f"⚠️  [PROCESS] Ticket cuisine échoué : {ticket_result.get('error')}")
-    except Exception as e:
-        print(f"⚠️  [PROCESS] Erreur ticket cuisine : {e}")
-
-    # ── Étape 7 : Mise à jour du statut de la commande ────────────────────────
-    if order_id:
+    # ── Étape 5 : Boutons de validation → Gérant ─────────────────────────────
+    resto_phone = str(config.get("resto_phone", "")).strip()
+    if order_id and resto_phone:
         try:
-            update_order_status(
-                order_id=order_id,
-                status="confirmed" if wa_status == "Envoyé" else "failed",
-                snack_id=snack_id,
+            items_txt = "\n".join(
+                f"  • {it.get('qty', 1)}x {it.get('name', '?')}"
+                for it in (parsed_items or [{"name": message_text, "qty": 1}])
             )
+            send_interactive_buttons(
+                config=config,
+                recipient_phone=resto_phone,
+                header_text="🆕 Nouvelle commande",
+                body_text=(
+                    f"Client : {from_phone}\n\n"
+                    f"{items_txt}\n\n"
+                    f"ID : {order_id[:8]}…"
+                ),
+                footer_text="SnackFlow • Validation requise",
+                buttons=[
+                    {"id": f"CONFIRM_{order_id}", "title": "✅ Valider"},
+                    {"id": f"REJECT_{order_id}",  "title": "❌ Refuser"},
+                    {"id": f"CALL_{order_id}",    "title": "📞 Appeler"},
+                ],
+            )
+            print(f"✅ [ORDER] Boutons validation envoyés → gérant ({_redact(resto_phone)})")
         except Exception as e:
-            print(f"⚠️  [PROCESS] update_order_status échoué : {e}")
+            print(f"⚠️  [ORDER] Boutons validation échoués : {e}")
+    else:
+        print("⚠️  [ORDER] resto_phone absent — boutons validation non envoyés.")
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"✅ [PROCESS] Terminé en {elapsed}s | WA: {wa_status}\n")
+    print(f"✅ [ORDER] Terminé en {elapsed}s\n")
 
 
 # =============================================================================

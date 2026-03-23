@@ -459,6 +459,26 @@ def update_order_status(order_id: str, status: str, snack_id: str = "") -> dict:
         return {"status": "error", "message": str(e)}
 
 
+def get_order_by_id(order_id: str, snack_id: str = "") -> Optional[dict]:
+    """
+    Récupère une commande par son UUID.
+
+    :param order_id: UUID de la commande.
+    :param snack_id: (optionnel) filtre de sécurité multi-tenant.
+    :return: Dict de la commande ou None si introuvable.
+    """
+    try:
+        sb = SupabaseClient.instance()
+        query = sb.table(TABLE_ORDERS).select("*").eq("id", order_id.strip())
+        if snack_id:
+            query = query.eq("snack_id", snack_id.strip())
+        response = query.single().execute()
+        return response.data or None
+    except Exception as e:
+        logger.error("❌ get_order_by_id(%s) : %s", order_id, e)
+        return None
+
+
 def get_orders(snack_id: str, limit: int = 100) -> list:
     """
     Retourne les dernières commandes d'un restaurant (tri DESC).
