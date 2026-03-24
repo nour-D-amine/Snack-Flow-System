@@ -23,6 +23,7 @@ Behavioral Rules :
   - Zéro GSheets, zéro Twilio, zéro IVR, zéro SMS, zéro appel vocal
 """
 
+import base64
 import hashlib
 import hmac
 import logging
@@ -33,8 +34,10 @@ import time
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+from urllib.parse import urlencode
 
-from flask import Flask, request, jsonify
+import requests as http_requests
+from flask import Flask, request, jsonify, redirect
 from dotenv import load_dotenv
 
 # --- Import des Tools Layer 3 ---
@@ -59,6 +62,7 @@ from layer3_tools.supabase_tool import (
 )
 from layer3_tools.gemini_tool import parse_order_text
 from layer3_tools.hubrise_tool import push_to_hubrise
+from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
 
 load_dotenv()
 
@@ -71,6 +75,13 @@ DEFAULT_SNACK_ID      = os.getenv("DEFAULT_SNACK_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET   = os.getenv("WHATSAPP_APP_SECRET", "")
 ADMIN_API_KEY         = os.getenv("ADMIN_API_KEY", "")
+
+# ─── HubRise OAuth2 ──────────────────────────────────────────────────────────
+HUBRISE_CLIENT_ID     = os.getenv("HUBRISE_CLIENT_ID", "")
+HUBRISE_CLIENT_SECRET = os.getenv("HUBRISE_CLIENT_SECRET", "")
+HUBRISE_REDIRECT_URI  = os.getenv("HUBRISE_REDIRECT_URI", "https://api.menudirect.fr/hubrise/callback")
+HUBRISE_AUTH_URL      = "https://manager.hubrise.com/oauth2/v1/authorize"
+HUBRISE_TOKEN_URL     = "https://manager.hubrise.com/oauth2/v1/token"
 
 if not WHATSAPP_APP_SECRET:
     _logger.warning(
@@ -514,9 +525,20 @@ def _handle_manager_callback(
     if action == "CONFIRM":
         # Mise à jour Supabase
         update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
-        # Push HubRise
-        hubrise_result = push_to_hubrise(order, config)
-        hubrise_ok     = "error" not in hubrise_result and not hubrise_result.get("skipped")
+
+        # Récupérer credentials HubRise du snack depuis Supabase
+        hr_token = str(config.get("hubrise_access_token", "") or "").strip()
+        hr_location = str(config.get("hubrise_location_id", "") or "").strip()
+
+        # Push HubRise (avec credentials dynamiques)
+        hubrise_result = push_to_hubrise(
+            order=order,
+            access_token=hr_token,
+            location_id=hr_location,
+            snack_name=nom_resto,
+        )
+        hubrise_ok = "error" not in hubrise_result and not hubrise_result.get("skipped")
+
         # Notification client
         items_txt = "\n".join(
             f"  • {it.get('qty', 1)}x {it.get('name', '?')}" for it in items
@@ -694,7 +716,142 @@ def admin_gdpr_delete():
 
 
 # =============================================================================
-# ROUTE 3 : GET /health — Health check
+# ROUTE 3 : GET /hubrise/connect — Initiation OAuth HubRise
+# =============================================================================
+
+@app.route("/hubrise/connect", methods=["GET"])
+def hubrise_connect():
+    """
+    Initie le flux OAuth2 HubRise pour un snack.
+
+    Paramètre query requis : snack_id (UUID du tenant).
+    Redirige le gérant vers la page d'autorisation HubRise.
+    Le snack_id est passé via le paramètre 'state' pour être récupéré au callback.
+    """
+    snack_id = request.args.get("snack_id", "").strip()
+    if not snack_id:
+        return jsonify({"error": "Paramètre snack_id requis"}), 400
+
+    if not HUBRISE_CLIENT_ID:
+        return jsonify({"error": "HUBRISE_CLIENT_ID non configuré"}), 503
+
+    params = {
+        "client_id":     HUBRISE_CLIENT_ID,
+        "redirect_uri":  HUBRISE_REDIRECT_URI,
+        "scope":         "location[orders.write]",
+        "response_type": "code",
+        "state":         snack_id,
+    }
+    auth_url = HUBRISE_AUTH_URL + "?" + urlencode(params)
+    _logger.info("🔗 [HubRise] OAuth redirect → snack_id=%s", snack_id)
+    return redirect(auth_url)
+
+
+# =============================================================================
+# ROUTE 4 : GET /hubrise/callback — Callback OAuth HubRise
+# =============================================================================
+
+@app.route("/hubrise/callback", methods=["GET"])
+def hubrise_callback():
+    """
+    Callback OAuth2 HubRise.
+
+    Reçoit le code d'autorisation et le state (snack_id).
+    Échange le code contre un access_token via POST /oauth2/v1/token.
+    Enregistre l'access_token et le location_id dans la table snacks (Supabase).
+    """
+    code     = request.args.get("code", "").strip()
+    state    = request.args.get("state", "").strip()  # = snack_id
+    error    = request.args.get("error", "").strip()
+
+    if error:
+        _logger.error("❌ [HubRise] OAuth error : %s", error)
+        return jsonify({"error": f"HubRise OAuth refusé : {error}"}), 400
+
+    if not code or not state:
+        return jsonify({"error": "Paramètres code et state requis"}), 400
+
+    snack_id = state
+
+    # ── Échange code → access_token (HTTP Basic Auth) ────────────────────────
+    if not HUBRISE_CLIENT_ID or not HUBRISE_CLIENT_SECRET:
+        _logger.error("❌ [HubRise] CLIENT_ID ou CLIENT_SECRET non configuré")
+        return jsonify({"error": "Configuration HubRise incomplète côté serveur"}), 503
+
+    # Authentification HTTP Basic : base64(client_id:client_secret)
+    basic_credentials = base64.b64encode(
+        f"{HUBRISE_CLIENT_ID}:{HUBRISE_CLIENT_SECRET}".encode()
+    ).decode()
+
+    try:
+        token_response = http_requests.post(
+            HUBRISE_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {basic_credentials}",
+                "Content-Type":  "application/x-www-form-urlencoded",
+            },
+            data={
+                "code":         code,
+                "redirect_uri": HUBRISE_REDIRECT_URI,
+                "grant_type":   "authorization_code",
+            },
+            timeout=15,
+        )
+        token_data = token_response.json()
+    except Exception as e:
+        _logger.error("❌ [HubRise] Token exchange network error : %s", e)
+        return jsonify({"error": f"Erreur réseau lors de l'échange : {e}"}), 502
+
+    if token_response.status_code not in (200, 201) or "access_token" not in token_data:
+        _logger.error(
+            "❌ [HubRise] Token exchange failed : HTTP %s | %s",
+            token_response.status_code, token_data,
+        )
+        return jsonify({
+            "error":   "Échange du code HubRise échoué",
+            "details": token_data,
+        }), 400
+
+    access_token = token_data["access_token"]
+    location_id  = token_data.get("location_id", "")
+    account_id   = token_data.get("account_id", "")
+
+    _logger.info(
+        "✅ [HubRise] Token obtenu | snack=%s | location=%s | account=%s",
+        snack_id, location_id, account_id,
+    )
+
+    # ── Enregistrement dans Supabase (table snacks) ──────────────────────────
+    try:
+        sb = SupabaseClient.instance()
+        update_data = {
+            "hubrise_access_token": access_token,
+        }
+        if location_id:
+            update_data["hubrise_location_id"] = location_id
+
+        sb.table(TABLE_SNACKS).update(update_data).eq("id", snack_id).execute()
+        _logger.info("✅ [HubRise] Credentials sauvés dans Supabase pour snack=%s", snack_id)
+    except Exception as e:
+        _logger.error("❌ [HubRise] Échec sauvegarde Supabase : %s", e)
+        return jsonify({"error": f"Token obtenu mais sauvegarde échouée : {e}"}), 500
+
+    # ── Invalidation du cache config ─────────────────────────────────────────
+    with _cache_lock:
+        _config_cache.pop(snack_id, None)
+        _cache_timestamps.pop(snack_id, None)
+
+    return jsonify({
+        "status":      "success",
+        "message":     "HubRise connecté avec succès !",
+        "snack_id":    snack_id,
+        "location_id": location_id,
+        "account_id":  account_id,
+    }), 200
+
+
+# =============================================================================
+# ROUTE 5 : GET /health — Health check
 # =============================================================================
 
 @app.route("/health", methods=["GET"])
@@ -704,7 +861,7 @@ def health_check():
     return jsonify({
         "status":   "ok",
         "service":  "Snack-Flow WhatsApp Webhook",
-        "version":  "2.0",
+        "version":  "2.1",
         "supabase": supabase_status,
     }), 200
 
@@ -714,7 +871,7 @@ def health_check():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("🚀 Snack-Flow v2.0 — WhatsApp Webhook — Démarrage Layer 2")
+    print("🚀 Snack-Flow v2.1 — WhatsApp Webhook — Démarrage Layer 2")
     print("━" * 55)
 
     REQUIRED_VARS = [
@@ -734,9 +891,11 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", os.getenv("SERVER_PORT", 5001)))
     print(f"✅ Webhook prêt — En écoute sur http://0.0.0.0:{port}")
     print("   Routes disponibles :")
-    print("   - POST /webhook → Message WhatsApp entrant (payload Meta réel)")
-    print("   - GET  /webhook → Vérification Meta (hub.challenge)")
-    print("   - GET  /health  → Health check")
+    print("   - POST /webhook         → Message WhatsApp entrant (payload Meta réel)")
+    print("   - GET  /webhook         → Vérification Meta (hub.challenge)")
+    print("   - GET  /hubrise/connect → Initier OAuth HubRise (param: snack_id)")
+    print("   - GET  /hubrise/callback→ Callback OAuth HubRise")
+    print("   - GET  /health          → Health check")
     print("━" * 55)
 
     app.run(host="0.0.0.0", port=port, debug=False)
