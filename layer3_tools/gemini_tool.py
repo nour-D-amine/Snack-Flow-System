@@ -1,32 +1,44 @@
 """
-Layer 3 — Tools : Gemini LLM Order Parser (Snack-Flow v3.0)
-============================================================
-Transforme un texte libre client ("2 burgers et 1 frite")
-en une liste structurée JSON utilisable dans la table `orders.items`.
+Layer 3 — Tools : Gemini Skills (SnackFlow v3.0)
+=================================================
+Deux Skills rigoureuses appuyées sur les Structured Outputs de Gemini 2.0 Flash.
+Zéro parsing regex, zéro chat libre, zéro JSON manuel.
 
-Architecture :
-  - Modèle : gemini-2.0-flash (Google Generative AI)
-  - Parsing JSON strict via prompt engineering
-  - Fallback deterministe si LLM indisponible (encapsulation texte brut)
-  - Zéro prix inventé : price=null si non mentionné
+Architecture BLAST — Skills :
+  ┌──────────────────────────────────────────────────┐
+  │  SKILL 1 — parse_order_skill(user_text)          │
+  │  Texte libre → HubRiseOrder (Pydantic-validated) │
+  ├──────────────────────────────────────────────────┤
+  │  SKILL 2 — generate_upsell_skill(order_data)     │
+  │  Panier JSON → UpsellSuggestion (AOV pur)        │
+  └──────────────────────────────────────────────────┘
+
+Principe fondamental :
+  - Structured Output : response_mime_type="application/json" + response_schema
+  - Gemini garantit le format JSON → Pydantic valide la structure
+  - Fallback déterministe si Gemini indisponible (non bloquant)
+  - Zéro politesse dans les prompts → économie maximale de tokens
 
 Variables .env requises :
   GEMINI_API_KEY   Clé API Google AI Studio (https://aistudio.google.com)
+  GEMINI_MODEL     Modèle (défaut : gemini-2.0-flash)
 
-Output schema :
-  [
-    {"name": "Burger classique", "qty": 2, "price": null},
-    {"name": "Frites",           "qty": 1, "price": null}
-  ]
+Schémas HubRise v1 (source : developers.hubrise.com) :
+  - quantity   → toujours string ("2", "1.5")
+  - price      → "8.50 EUR" (Money string)
+  - options    → [{name: str, price: str}] (modifiers/toppings)
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
-import re
-from typing import Optional
+import threading
+from typing import List, Optional
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
 
@@ -35,64 +47,162 @@ load_dotenv()
 logger = logging.getLogger("snack_flow.gemini")
 if not logger.handlers:
     _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(levelname)s | gemini_tool | %(message)s"))
+    _h.setFormatter(logging.Formatter("%(levelname)s | gemini_skill | %(message)s"))
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-
-# Prompt système strict — retourne UNIQUEMENT du JSON
-_SYSTEM_PROMPT = """
-Tu es un assistant de commande pour un snack-bar.
-Ton unique rôle : extraire les articles commandés depuis un message client en texte libre.
-
-Règles absolues :
-1. Réponds UNIQUEMENT avec un tableau JSON valide, rien d'autre.
-2. Chaque élément a les clés : "name" (str), "qty" (int ≥ 1), "price" (null).
-3. Si tu ne trouves aucun article, retourne [].
-4. Ne jamais inventer des prix — toujours null.
-5. Consolide les doublons (ex: "2 burgers" + "un burger" → qty: 3).
-6. Normalise les noms en français standard.
-
-Exemple :
-  Input  : "Je voudrais 2 burgers, 1 frite et une boisson s'il vous plaît"
-  Output : [{"name": "Burger", "qty": 2, "price": null}, {"name": "Frites", "qty": 1, "price": null}, {"name": "Boisson", "qty": 1, "price": null}]
-""".strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 
-# ─── Initialisation du client Gemini ──────────────────────────────────────────
+# =============================================================================
+# SCHÉMAS PYDANTIC — Source de vérité structurelle
+# =============================================================================
 
-import threading as _threading
-_gemini_client = None
-_gemini_lock   = _threading.Lock()
+class OrderOption(BaseModel):
+    """Modifier/topping appliqué à un article (ex: sans oignon, extra sauce)."""
+    model_config = {"coerce_numbers_to_str": True}
+
+    name: str = Field(..., description="Nom de l'option ou du modificateur")
+    price: str = Field(default="0.00 EUR", description="Prix de l'option au format HubRise Money")
+
+    @field_validator("price")
+    @classmethod
+    def ensure_money_format(cls, v: str) -> str:
+        """Garantit le format 'X.XX EUR' même si Gemini retourne un float."""
+        v = str(v).strip()
+        if v and not v.endswith("EUR"):
+            try:
+                return f"{float(v):.2f} EUR"
+            except ValueError:
+                pass
+        return v
 
 
-def _get_gemini_client():
-    """Retourne le client Google Generative AI (lazy init, thread-safe)."""
-    global _gemini_client
+class OrderItem(BaseModel):
+    """
+    Article commandé au format HubRise v1.
+
+    Note HubRise : quantity et price sont TOUJOURS des strings.
+    """
+    model_config = {"coerce_numbers_to_str": True}
+
+    product_name: str = Field(..., description="Nom du produit tel qu'énoncé par le client")
+    quantity: str     = Field(default="1", description="Quantité commandée (string HubRise)")
+    price: str        = Field(default="0.00 EUR", description="Prix unitaire HubRise Money")
+    options: List[OrderOption] = Field(default_factory=list, description="Modificateurs/toppings")
+    customer_notes: Optional[str] = Field(default=None, description="Note spécifique à cet article")
+
+    @field_validator("quantity")
+    @classmethod
+    def ensure_string_quantity(cls, v) -> str:
+        """HubRise exige quantity comme string (ex: '2', '1.5')."""
+        return str(v).strip() or "1"
+
+    @field_validator("price")
+    @classmethod
+    def ensure_money_format(cls, v: str) -> str:
+        v = str(v).strip()
+        if v and not v.endswith("EUR"):
+            try:
+                return f"{float(v):.2f} EUR"
+            except ValueError:
+                pass
+        return v
+
+    def to_legacy_dict(self) -> dict:
+        """
+        Convertit vers le format legacy {name, qty, price} pour la compatibilité
+        Supabase + hubrise_tool._map_items().
+        """
+        try:
+            qty = int(float(self.quantity))
+        except (ValueError, TypeError):
+            qty = 1
+        try:
+            price_val = float(self.price.replace(" EUR", "").strip())
+        except (ValueError, AttributeError):
+            price_val = 0.0
+
+        return {
+            "name":    self.product_name,
+            "qty":     qty,
+            "price":   price_val if price_val > 0 else None,
+            "options": [o.name for o in self.options],
+        }
+
+
+class HubRiseOrder(BaseModel):
+    """
+    Commande complète au format HubRise v1.
+    Produit de la Skill 1 (OrderParser).
+    """
+    items: List[OrderItem] = Field(default_factory=list, description="Liste des articles commandés")
+    customer_notes: Optional[str] = Field(
+        default=None,
+        description="Note globale du client pour toute la commande"
+    )
+    service_type: str = Field(
+        default="collection",
+        description="Type de service HubRise — toujours 'collection' pour SnackFlow"
+    )
+
+    def to_legacy_items(self) -> list:
+        """Retourne la liste d'items au format legacy pour Supabase/HubRise push."""
+        return [item.to_legacy_dict() for item in self.items]
+
+    def is_empty(self) -> bool:
+        return len(self.items) == 0
+
+
+class UpsellSuggestion(BaseModel):
+    """
+    Suggestion d'upsell produite par la Skill 2 (LogicalUpseller).
+
+    RÈGLE MÉTIER ABSOLUE :
+      - Aucune réduction, aucun code promo, aucun produit gratuit.
+      - Objectif unique : augmentation pure du panier moyen (AOV).
+    """
+    suggested_item: str   = Field(..., description="Nom du produit suggéré")
+    reason: str           = Field(..., description="Justification interne (ne pas envoyer au client)")
+    whatsapp_message: str = Field(
+        ...,
+        description=(
+            "Message WhatsApp à envoyer au client. "
+            "Naturel, concis (1-2 phrases max). "
+            "INTERDIT : réduction, promo, produit gratuit."
+        )
+    )
+
+
+# =============================================================================
+# CLIENT GEMINI — Lazy init thread-safe
+# =============================================================================
+
+_gemini_lock   = threading.Lock()
+_genai_module  = None
+
+
+def _get_genai():
+    """Retourne le module google.generativeai (lazy import, thread-safe)."""
+    global _genai_module
     with _gemini_lock:
-        # Double-checked locking: re-test inside the lock
-        if _gemini_client is not None:
-            return _gemini_client
+        if _genai_module is not None:
+            return _genai_module
 
         if not GEMINI_API_KEY:
             raise RuntimeError(
                 "❌ GEMINI_API_KEY manquante dans .env\n"
                 "   Créez une clé sur https://aistudio.google.com"
             )
-
         try:
             import google.generativeai as genai
             genai.configure(api_key=GEMINI_API_KEY)
-            _gemini_client = genai.GenerativeModel(
-                model_name=GEMINI_MODEL,
-                system_instruction=_SYSTEM_PROMPT,
-            )
-            logger.info("✅ Gemini client initialisé → modèle=%s", GEMINI_MODEL)
-            return _gemini_client
+            _genai_module = genai
+            logger.info("✅ Gemini configuré → modèle=%s", GEMINI_MODEL)
+            return _genai_module
         except ImportError:
             raise RuntimeError(
                 "❌ Package 'google-generativeai' non installé.\n"
@@ -101,105 +211,196 @@ def _get_gemini_client():
 
 
 # =============================================================================
-# FONCTION PRINCIPALE : parse_order_text
+# SKILL 1 — ORDER PARSER (Text → HubRiseOrder)
 # =============================================================================
 
-def parse_order_text(message_text: str) -> list:
+_ORDER_PARSER_SYSTEM = (
+    "Tu es un extracteur de données POS. "
+    "Ta seule mission est de transformer le texte client en JSON HubRise. "
+    "Ne discute jamais. "
+    "Règles absolues : "
+    "1. Extrais uniquement les articles commandés. "
+    "2. Si un produit n'est pas clair, extrais-le tel quel avec price='0.00 EUR'. "
+    "3. Consolide les doublons (ex: '2 burgers' + 'un burger' → quantity='3'). "
+    "4. Normalise les noms en français standard et capitalise la première lettre. "
+    "5. Ne jamais inventer un prix. "
+    "6. Les options/modificateurs vont dans le champ options de l'article concerné. "
+    "7. Si aucun article n'est trouvé, retourne items=[]."
+)
+
+_ORDER_PARSER_GENERATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "temperature": 0.0,  # Déterministe — zéro créativité
+    "top_p": 1.0,
+    "max_output_tokens": 512,
+}
+
+
+def parse_order_skill(user_text: str) -> HubRiseOrder:
     """
-    Parse un texte libre client et retourne une liste d'articles structurés.
+    SKILL 1 — Order Parser.
 
-    Utilise Gemini pour extraire articles + quantités.
-    Fallback deterministe si LLM indisponible (encapsule le texte brut).
+    Transforme un message texte libre client en commande structurée HubRise.
+    Utilise les Structured Outputs de Gemini : zéro regex, zéro json.loads manuel.
 
-    :param message_text: Texte brut du message WhatsApp client.
-    :return: Liste JSONB ex: [{"name": "Burger", "qty": 2, "price": null}]
+    :param user_text: Texte brut du message WhatsApp client.
+    :return: HubRiseOrder validé par Pydantic.
+             Fallback : HubRiseOrder avec un item encapsulé si Gemini indisponible.
 
     Exemples :
-      "2 burgers et 1 frite"
-      → [{"name": "Burger", "qty": 2, "price": null},
-         {"name": "Frites",  "qty": 1, "price": null}]
-
-      "Bonjour !"
-      → []
+      "2 burgers avec sauce béarnaise et 1 frite"
+      → HubRiseOrder(items=[
+            OrderItem(product_name="Burger", quantity="2", options=[OrderOption(name="sauce béarnaise")]),
+            OrderItem(product_name="Frites", quantity="1"),
+        ])
     """
-    if not message_text or not message_text.strip():
-        return []
+    if not user_text or not user_text.strip():
+        logger.info("⚠️  parse_order_skill → texte vide → HubRiseOrder vide retourné")
+        return HubRiseOrder(items=[])
 
-    # ── Tentative LLM Gemini ──────────────────────────────────────────────────
+    text = user_text.strip()
+
     try:
-        client = _get_gemini_client()
-        response = client.generate_content(message_text.strip())
-        raw = response.text.strip()
+        genai = _get_genai()
 
-        # Nettoyage des fences markdown éventuels (```json ... ```)
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
+        # Structured Output : Gemini retourne directement un JSON conforme au schéma
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=_ORDER_PARSER_SYSTEM,
+        )
 
-        items = json.loads(raw)
+        response = model.generate_content(
+            text,
+            generation_config={
+                **_ORDER_PARSER_GENERATION_CONFIG,
+                "response_schema": HubRiseOrder,
+            },
+        )
 
-        if not isinstance(items, list):
-            raise ValueError(f"Réponse Gemini non-liste : {type(items)}")
-
-        # Validation minimale de chaque item
-        validated = []
-        for item in items:
-            if isinstance(item, dict) and "name" in item:
-                validated.append({
-                    "name":  str(item.get("name", "")).strip(),
-                    "qty":   max(1, int(item.get("qty", 1))),
-                    "price": item.get("price"),  # null par défaut
-                })
+        raw_json = response.text.strip()
+        order_data = json.loads(raw_json)
+        order = HubRiseOrder.model_validate(order_data)
 
         logger.info(
-            "✅ parse_order_text → %d article(s) extraits | '%s...'",
-            len(validated), message_text[:40]
+            "✅ parse_order_skill → %d article(s) | '%s...'",
+            len(order.items), text[:40],
         )
-        return validated
+        return order
 
     except RuntimeError as e:
-        # GEMINI_API_KEY absente ou package manquant → fallback
         logger.warning("⚠️  Gemini indisponible (%s) → fallback texte brut", e)
-    except json.JSONDecodeError as e:
-        logger.warning("⚠️  Gemini JSON invalide (%s) → fallback texte brut", e)
-    except Exception as e:
-        logger.warning("⚠️  Gemini erreur inattendue (%s) → fallback texte brut", e)
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("⚠️  parse_order_skill erreur (%s) → fallback texte brut", type(e).__name__)
 
-    # ── Fallback : encapsulation texte brut ───────────────────────────────────
-    return _fallback_parse(message_text)
+    return _fallback_order(text)
 
 
-def _fallback_parse(text: str) -> list:
+def _fallback_order(text: str) -> HubRiseOrder:
     """
-    Fallback deterministe (sans LLM).
-    Encapsule le texte brut comme un article unique.
-    Tente une extraction naive pour les patterns "N article".
-
-    :param text: Texte brut du message.
-    :return: Liste d'items [{...}]
+    Fallback déterministe (sans LLM).
+    Encapsule le texte brut comme un article unique avec price=0.
+    Garantit que le webhook ne crash jamais.
     """
-    items = []
-
-    # Pattern simple : "2 burgers", "un sandwich", "3 pizzas"
-    pattern = re.compile(
-        r"\b(\d+|un|une|deux|trois|quatre|cinq)\s+([a-zA-Zàâäéèêëïîôùûüÿç\s-]{2,30})",
-        re.IGNORECASE
+    logger.info("🔄 Fallback order → encapsulation texte brut")
+    return HubRiseOrder(
+        items=[
+            OrderItem(
+                product_name=text[:200].strip(),
+                quantity="1",
+                price="0.00 EUR",
+                customer_notes="[Extraction automatique échouée — vérification manuelle requise]",
+            )
+        ],
+        customer_notes="[Commande brute — parsing indisponible]",
     )
-    _num_words = {"un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5}
 
-    for match in pattern.finditer(text):
-        qty_str = match.group(1).lower()
-        name    = match.group(2).strip().rstrip("s")  # dé-pluralise naïvement
 
-        qty = _num_words.get(qty_str, None) or int(qty_str)
-        items.append({"name": name.capitalize(), "qty": qty, "price": None})
+# =============================================================================
+# SKILL 2 — LOGICAL UPSELLER (HubRiseOrder → UpsellSuggestion)
+# =============================================================================
 
-    if items:
-        logger.info("✅ Fallback parse → %d article(s) extrait(s) (regex)", len(items))
-        return items
+_UPSELL_SYSTEM = (
+    "Tu es un conseiller commercial de snack-bar. "
+    "Analyse le JSON du panier client et propose UNE SEULE suggestion d'article complémentaire. "
+    "Logique métier STRICTE : "
+    "  - Si aucune boisson n'est présente dans le panier → suggère une boisson. "
+    "  - Si le menu semble incomplet (pas d'accompagnement/frites) → suggère un accompagnement. "
+    "  - Si le panier semble complet → suggère un dessert. "
+    "INTERDICTION FORMELLE ET ABSOLUE : "
+    "  - Ne jamais proposer de réduction. "
+    "  - Ne jamais proposer de code promo. "
+    "  - Ne jamais proposer un produit gratuit. "
+    "  - Ne jamais mentionner un prix inférieur au prix normal. "
+    "  - L'objectif est l'augmentation pure du panier moyen (AOV). "
+    "Le champ 'reason' est INTERNE (pourquoi tu suggères), il n'est jamais envoyé au client. "
+    "Le champ 'whatsapp_message' est le texte exact à envoyer via WhatsApp : "
+    "  naturel, chaleureux, concis (1-2 phrases maximum). "
+    "  Commence TOUJOURS par un emoji approprié."
+)
 
-    # Dernier recours : texte brut complet comme article unique
-    logger.info("✅ Fallback parse → texte brut encapsulé")
-    return [{"name": text[:200].strip(), "qty": 1, "price": None}]
+_UPSELL_GENERATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "temperature": 0.3,  # Légère créativité pour la formulation, mais cadré
+    "top_p": 0.9,
+    "max_output_tokens": 256,
+}
+
+
+def generate_upsell_skill(order_data: HubRiseOrder) -> Optional[UpsellSuggestion]:
+    """
+    SKILL 2 — Logical Upseller.
+
+    Analyse le panier JSON et génère une suggestion d'upsell ciblée.
+    Contrainte absolue : zéro réduction, zéro promo, zéro produit gratuit.
+    Objectif : augmentation pure du panier moyen (AOV).
+
+    :param order_data: HubRiseOrder produit par parse_order_skill.
+    :return: UpsellSuggestion ou None si panier vide / Gemini indisponible.
+    """
+    if not order_data or order_data.is_empty():
+        logger.info("⚠️  generate_upsell_skill → panier vide → pas de suggestion")
+        return None
+
+    # Sérialise le panier pour le contexte du prompt
+    basket_json = json.dumps(
+        order_data.model_dump(exclude={"service_type"}),
+        ensure_ascii=False,
+        indent=2,
+    )
+    prompt = f"Panier client :\n{basket_json}"
+
+    try:
+        genai = _get_genai()
+
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=_UPSELL_SYSTEM,
+        )
+
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                **_UPSELL_GENERATION_CONFIG,
+                "response_schema": UpsellSuggestion,
+            },
+        )
+
+        raw_json = response.text.strip()
+        suggestion_data = json.loads(raw_json)
+        suggestion = UpsellSuggestion.model_validate(suggestion_data)
+
+        logger.info(
+            "✅ generate_upsell_skill → suggestion : '%s' | raison : '%s'",
+            suggestion.suggested_item, suggestion.reason,
+        )
+        return suggestion
+
+    except RuntimeError as e:
+        logger.warning("⚠️  Gemini indisponible pour upsell (%s) → pas de suggestion", e)
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("⚠️  generate_upsell_skill erreur (%s) → pas de suggestion", type(e).__name__)
+
+    return None
 
 
 # =============================================================================
@@ -207,15 +408,31 @@ def _fallback_parse(text: str) -> list:
 # =============================================================================
 
 if __name__ == "__main__":
+    import sys
+
     test_messages = [
-        "Je voudrais 2 burgers et 1 frite s'il vous plaît !",
+        "2 burgers avec sauce béarnaise et 1 grande frite",
         "3 pizzas margherita et 2 coca",
-        "Bonjour, c'est possible d'avoir un sandwich jambon fromage ?",
-        "Bonsoir !",
+        "Je voudrais un sandwich jambon fromage",
+        "Bonsoir ! Un menu complet avec frites, burger et une limonade",
+        "kebab x2 sans oignon",
+        "Bonjour",  # → items vides attendus
     ]
 
-    print("🧪 Test de parse_order_text()\n" + "─" * 50)
+    print("🧪 SKILL 1 — OrderParser\n" + "─" * 60)
     for msg in test_messages:
-        result = parse_order_text(msg)
-        print(f"  Input  : {msg!r}")
-        print(f"  Output : {json.dumps(result, ensure_ascii=False)}\n")
+        print(f"\n  📩 Input  : {msg!r}")
+        order = parse_order_skill(msg)
+        print(f"  📦 Items  : {order.model_dump_json(indent=2)}")
+
+        print("\n  🎯 SKILL 2 — UpsellSuggestion :")
+        suggestion = generate_upsell_skill(order)
+        if suggestion:
+            print(f"  ➕ Produit suggéré : {suggestion.suggested_item}")
+            print(f"  📱 Message WA      : {suggestion.whatsapp_message}")
+            print(f"  🔍 Raison interne  : {suggestion.reason}")
+        else:
+            print("  ➖ Aucune suggestion (panier vide ou Gemini indisponible)")
+        print("─" * 60)
+
+    sys.exit(0)

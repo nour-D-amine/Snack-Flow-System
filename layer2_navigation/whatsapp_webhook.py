@@ -60,7 +60,7 @@ from layer3_tools.supabase_tool import (
     get_order_by_id,
     health_check as supabase_health,
 )
-from layer3_tools.gemini_tool import parse_order_text
+from layer3_tools.gemini_tool import parse_order_skill, generate_upsell_skill
 from layer3_tools.hubrise_tool import push_to_hubrise
 from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
 
@@ -580,14 +580,15 @@ def _process_new_order(
     config: dict,
 ):
     """
-    Orchestre le traitement complet d'une nouvelle commande client :
+    Orchestre le traitement complet d'une nouvelle commande client (Skills v3.0) :
       1. Détection RGPD
       2. Upsert customer CRM
       3. Notice RGPD Art. 13 (premier contact)
-      4. Parsing LLM Gemini → items JSONB
-      5. Création commande Supabase (status=pending)
-      6. Confirmation WhatsApp → client (menu CTA)
-      7. Boutons de validation → gérant (CONFIRM / REJECT / CALL)
+      4. SKILL 1 — parse_order_skill()    → HubRiseOrder (Pydantic-validated)
+      5. SKILL 2 — generate_upsell_skill() → UpsellSuggestion (AOV pur, sans promo)
+      6. Création commande Supabase (status=pending)
+      7. Message combiné WhatsApp → client (récapitulatif + suggestion upsell)
+      8. Boutons de validation → gérant (CONFIRM / REJECT / CALL)
     """
     print(f"\n🔄 [ORDER] Démarrage | {snack_id} | {_redact(from_phone)}")
     start_time = time.time()
@@ -613,24 +614,48 @@ def _process_new_order(
         except Exception as e:
             print(f"⚠️  [ORDER] Notice RGPD échouée (non bloquant) : {e}")
 
-    # ── Étape 2 : Parsing LLM (Gemini) → items JSONB ────────────────────────
-    parsed_items = []
+    # ── Étape 2a : SKILL 1 — OrderParser (texte → HubRiseOrder) ─────────────
+    from layer3_tools.gemini_tool import HubRiseOrder  # import local pour éviter cycle
+    order_data: HubRiseOrder = HubRiseOrder(items=[])  # défaut sécurisé
+
     if message_type == "text" and message_text:
         try:
-            parsed_items = parse_order_text(message_text)
-            print(f"✅ [ORDER] Gemini : {len(parsed_items)} article(s) → {parsed_items}")
+            order_data = parse_order_skill(message_text)
+            print(
+                f"✅ [SKILL1] OrderParser → {len(order_data.items)} article(s) "
+                f"| {[it.product_name for it in order_data.items]}"
+            )
         except Exception as e:
-            print(f"⚠️  [ORDER] Gemini parse échoué : {e}")
+            print(f"⚠️  [SKILL1] parse_order_skill échoué (non bloquant) : {e}")
 
-    # ── Étape 3 : Création commande (status=pending) ─────────────────────────
+    # ── Étape 2b : SKILL 2 — LogicalUpseller (panier → suggestion AOV) ──────
+    upsell = None
+    try:
+        upsell = generate_upsell_skill(order_data)
+        if upsell:
+            print(
+                f"✅ [SKILL2] Upsell → '{upsell.suggested_item}' | "
+                f"raison='{upsell.reason}'"
+            )
+        else:
+            print("ℹ️  [SKILL2] Aucune suggestion upsell (panier vide ou LLM indisponible)")
+    except Exception as e:
+        print(f"⚠️  [SKILL2] generate_upsell_skill échoué (non bloquant) : {e}")
+
+    # Conversion vers format legacy pour Supabase + hubrise_tool
+    parsed_items = order_data.to_legacy_items() if not order_data.is_empty() else [
+        {"name": message_text or f"[{message_type}]", "qty": 1, "price": None}
+    ]
+
+    # ── Étape 3 : Création commande Supabase (status=pending) ────────────────
     order_id: Optional[str] = None
     try:
         order_result = create_order(
             snack_id=snack_id,
             data={
                 "customer_phone": from_phone,
-                "items": parsed_items or [{"name": message_text or f"[{message_type}]", "qty": 1}],
-                "status": "pending",
+                "items":          parsed_items,
+                "status":         "pending",
             },
         )
         order_id = order_result.get("row", {}).get("id")
@@ -638,13 +663,46 @@ def _process_new_order(
     except Exception as e:
         print(f"⚠️  [ORDER] create_order échoué : {e}")
 
-    # ── Étape 4 : Confirmation WhatsApp → Client ──────────────────────────────
+    # ── Étape 4 : Message combiné WhatsApp → Client ───────────────────────────
+    # Récapitulatif des articles
+    if parsed_items and parsed_items[0].get("name") != message_text:
+        recap_lines = "\n".join(
+            f"  • {it.get('qty', 1)}x {it.get('name', '?')}"
+            for it in parsed_items
+        )
+        recap_block = f"🧾 *Récapitulatif de votre commande :*\n\n{recap_lines}"
+    else:
+        recap_block = f"📝 *Commande reçue :*\n  {message_text[:200]}"
+
+    # Bloc upsell (uniquement si suggestion disponible)
+    upsell_block = ""
+    if upsell and upsell.whatsapp_message:
+        upsell_block = f"\n\n➕ *Et pourquoi pas...* \n{upsell.whatsapp_message}"
+
+    # Note client globale
+    global_note = ""
+    if order_data.customer_notes:
+        global_note = f"\n\n📌 Note : {order_data.customer_notes}"
+
+    client_message = (
+        f"{recap_block}"
+        f"{upsell_block}"
+        f"{global_note}"
+        f"\n\n✅ Nous vous confirmons votre commande dans quelques instants !"
+    )
+
     try:
-        wa_result = send_interactive_menu(config, from_phone)
+        wa_result = send_text_message(config, from_phone, client_message)
         if "error" not in wa_result:
-            print(f"✅ [ORDER] Menu WA envoyé → {_redact(from_phone)}")
+            has_upsell = "✅" if upsell else "—"
+            print(f"✅ [ORDER] Message combiné (recap+upsell={has_upsell}) → {_redact(from_phone)}")
         else:
-            print(f"❌ [ORDER] Échec envoi menu WA : {wa_result.get('error')}")
+            print(f"❌ [ORDER] Échec envoi message client : {wa_result.get('error')}")
+            # Fallback : tente d'envoyer le menu interactif
+            try:
+                send_interactive_menu(config, from_phone)
+            except Exception:
+                pass
     except Exception as e:
         print(f"❌ [ORDER] Erreur envoi WA client : {e}")
 
@@ -654,7 +712,7 @@ def _process_new_order(
         try:
             items_txt = "\n".join(
                 f"  • {it.get('qty', 1)}x {it.get('name', '?')}"
-                for it in (parsed_items or [{"name": message_text, "qty": 1}])
+                for it in parsed_items
             )
             send_interactive_buttons(
                 config=config,
