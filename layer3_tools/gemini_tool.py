@@ -65,8 +65,8 @@ class OrderOption(BaseModel):
     """Modifier/topping appliqué à un article (ex: sans oignon, extra sauce)."""
     model_config = {"coerce_numbers_to_str": True}
 
-    name: str = Field(..., description="Nom de l'option ou du modificateur")
-    price: str = Field(default="0.00 EUR", description="Prix de l'option au format HubRise Money")
+    name: str = Field(description="Nom de l'option ou du modificateur")
+    price: str = Field(description="Prix de l'option au format HubRise Money")
 
     @field_validator("price")
     @classmethod
@@ -89,11 +89,11 @@ class OrderItem(BaseModel):
     """
     model_config = {"coerce_numbers_to_str": True}
 
-    product_name: str = Field(..., description="Nom du produit tel qu'énoncé par le client")
-    quantity: str     = Field(default="1", description="Quantité commandée (string HubRise)")
-    price: str        = Field(default="0.00 EUR", description="Prix unitaire HubRise Money")
-    options: List[OrderOption] = Field(default_factory=list, description="Modificateurs/toppings")
-    customer_notes: Optional[str] = Field(default=None, description="Note spécifique à cet article")
+    product_name: str = Field(description="Nom du produit tel qu'énoncé par le client")
+    quantity: str     = Field(description="Quantité commandée (string HubRise)")
+    price: str        = Field(description="Prix unitaire HubRise Money")
+    options: List[OrderOption] = Field(description="Modificateurs/toppings")
+    customer_notes: Optional[str] = Field(description="Note spécifique à cet article")
 
     @field_validator("quantity")
     @classmethod
@@ -139,13 +139,11 @@ class HubRiseOrder(BaseModel):
     Commande complète au format HubRise v1.
     Produit de la Skill 1 (OrderParser).
     """
-    items: List[OrderItem] = Field(default_factory=list, description="Liste des articles commandés")
+    items: List[OrderItem] = Field(description="Liste des articles commandés")
     customer_notes: Optional[str] = Field(
-        default=None,
         description="Note globale du client pour toute la commande"
     )
     service_type: str = Field(
-        default="collection",
         description="Type de service HubRise — toujours 'collection' pour SnackFlow"
     )
 
@@ -165,10 +163,9 @@ class UpsellSuggestion(BaseModel):
       - Aucune réduction, aucun code promo, aucun produit gratuit.
       - Objectif unique : augmentation pure du panier moyen (AOV).
     """
-    suggested_item: str   = Field(..., description="Nom du produit suggéré")
-    reason: str           = Field(..., description="Justification interne (ne pas envoyer au client)")
+    suggested_item: str   = Field(description="Nom du produit suggéré")
+    reason: str           = Field(description="Justification interne (ne pas envoyer au client)")
     whatsapp_message: str = Field(
-        ...,
         description=(
             "Message WhatsApp à envoyer au client. "
             "Naturel, concis (1-2 phrases max). "
@@ -225,14 +222,30 @@ _ORDER_PARSER_SYSTEM = (
     "4. Normalise les noms en français standard et capitalise la première lettre. "
     "5. Ne jamais inventer un prix. "
     "6. Les options/modificateurs vont dans le champ options de l'article concerné. "
-    "7. Si aucun article n'est trouvé, retourne items=[]."
+    "7. Si aucun article n'est trouvé, retourne items=[].\n"
+    "IMPORTANT: Tu dois STRICTEMENT répondre selon ce format JSON (et aucun autre texte) :\n"
+    "{\n"
+    "  \"items\": [\n"
+    "    {\n"
+    "      \"product_name\": \"Nom du produit\",\n"
+    "      \"quantity\": \"1\",\n"
+    "      \"price\": \"0.00 EUR\",\n"
+    "      \"options\": [\n"
+    "        {\"name\": \"Option\", \"price\": \"0.00 EUR\"}\n"
+    "      ],\n"
+    "      \"customer_notes\": \"notes optionnelles ou null\"\n"
+    "    }\n"
+    "  ],\n"
+    "  \"customer_notes\": \"notes globales ou null\",\n"
+    "  \"service_type\": \"collection\"\n"
+    "}\n"
 )
 
 _ORDER_PARSER_GENERATION_CONFIG = {
     "response_mime_type": "application/json",
     "temperature": 0.0,  # Déterministe — zéro créativité
     "top_p": 1.0,
-    "max_output_tokens": 512,
+    "max_output_tokens": 1024,
 }
 
 
@@ -288,11 +301,10 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
             text,
             generation_config={
                 **_ORDER_PARSER_GENERATION_CONFIG,
-                "response_schema": HubRiseOrder,
             },
         )
 
-        raw_json = response.text.strip()
+        raw_json = response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```').strip()
         order_data = json.loads(raw_json)
         order = HubRiseOrder.model_validate(order_data)
 
@@ -304,8 +316,8 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
 
     except RuntimeError as e:
         logger.warning("⚠️  Gemini indisponible (%s) → fallback texte brut", e)
-    except (json.JSONDecodeError, Exception) as e:
-        logger.warning("⚠️  parse_order_skill erreur (%s) → fallback texte brut", type(e).__name__)
+    except Exception as e:
+        logger.warning("⚠️  parse_order_skill erreur (%s: %s) → fallback texte brut", type(e).__name__, e)
 
     return _fallback_order(text)
 
@@ -350,14 +362,20 @@ _UPSELL_SYSTEM = (
     "Le champ 'reason' est INTERNE (pourquoi tu suggères), il n'est jamais envoyé au client. "
     "Le champ 'whatsapp_message' est le texte exact à envoyer via WhatsApp : "
     "  naturel, chaleureux, concis (1-2 phrases maximum). "
-    "  Commence TOUJOURS par un emoji approprié."
+    "  Commence TOUJOURS par un emoji approprié.\n"
+    "IMPORTANT: Tu dois STRICTEMENT répondre selon ce format JSON (et aucun autre texte) :\n"
+    "{\n"
+    "  \"suggested_item\": \"Nom du produit\",\n"
+    "  \"reason\": \"Justification interne\",\n"
+    "  \"whatsapp_message\": \"Message formaté...\"\n"
+    "}\n"
 )
 
 _UPSELL_GENERATION_CONFIG = {
     "response_mime_type": "application/json",
     "temperature": 0.3,  # Légère créativité pour la formulation, mais cadré
     "top_p": 0.9,
-    "max_output_tokens": 256,
+    "max_output_tokens": 1024,
 }
 
 
@@ -409,11 +427,10 @@ def generate_upsell_skill(order_data: HubRiseOrder, menu_context: dict = None) -
             prompt,
             generation_config={
                 **_UPSELL_GENERATION_CONFIG,
-                "response_schema": UpsellSuggestion,
             },
         )
 
-        raw_json = response.text.strip()
+        raw_json = response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```').strip()
         suggestion_data = json.loads(raw_json)
         suggestion = UpsellSuggestion.model_validate(suggestion_data)
 
@@ -425,8 +442,8 @@ def generate_upsell_skill(order_data: HubRiseOrder, menu_context: dict = None) -
 
     except RuntimeError as e:
         logger.warning("⚠️  Gemini indisponible pour upsell (%s) → pas de suggestion", e)
-    except (json.JSONDecodeError, Exception) as e:
-        logger.warning("⚠️  generate_upsell_skill erreur (%s) → pas de suggestion", type(e).__name__)
+    except Exception as e:
+        logger.warning("⚠️  generate_upsell_skill erreur (%s: %s) → pas de suggestion", type(e).__name__, e)
 
     return None
 
