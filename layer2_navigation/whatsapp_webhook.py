@@ -24,6 +24,7 @@ Behavioral Rules :
 """
 
 import base64
+import functools
 import hashlib
 import hmac
 import logging
@@ -31,6 +32,7 @@ import os
 import re
 import threading
 import time
+import traceback
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -58,10 +60,13 @@ from layer3_tools.supabase_tool import (
     create_order,
     update_order_status,
     get_order_by_id,
+    get_order_by_hubrise_id,
+    link_hubrise_order,
     health_check as supabase_health,
 )
 from layer3_tools.gemini_tool import parse_order_skill, generate_upsell_skill
-from layer3_tools.hubrise_tool import push_to_hubrise
+from layer3_tools.hubrise_tool import push_to_hubrise, sync_stock_with_supabase
+from layer3_tools.alert_tool import send_alert_async, format_exception_alert
 from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
 
 load_dotenv()
@@ -77,11 +82,13 @@ WHATSAPP_APP_SECRET   = os.getenv("WHATSAPP_APP_SECRET", "")
 ADMIN_API_KEY         = os.getenv("ADMIN_API_KEY", "")
 
 # ─── HubRise OAuth2 ──────────────────────────────────────────────────────────
-HUBRISE_CLIENT_ID     = os.getenv("HUBRISE_CLIENT_ID", "")
-HUBRISE_CLIENT_SECRET = os.getenv("HUBRISE_CLIENT_SECRET", "")
-HUBRISE_REDIRECT_URI  = os.getenv("HUBRISE_REDIRECT_URI", "https://api.menudirect.fr/hubrise/callback")
-HUBRISE_AUTH_URL      = "https://manager.hubrise.com/oauth2/v1/authorize"
-HUBRISE_TOKEN_URL     = "https://manager.hubrise.com/oauth2/v1/token"
+HUBRISE_CLIENT_ID      = os.getenv("HUBRISE_CLIENT_ID", "")
+HUBRISE_CLIENT_SECRET  = os.getenv("HUBRISE_CLIENT_SECRET", "")
+HUBRISE_REDIRECT_URI   = os.getenv("HUBRISE_REDIRECT_URI", "https://api.menudirect.fr/hubrise/callback")
+HUBRISE_AUTH_URL       = "https://manager.hubrise.com/oauth2/v1/authorize"
+HUBRISE_TOKEN_URL      = "https://manager.hubrise.com/oauth2/v1/token"
+# Secret dédié pour signer les webhooks HubRise (fallback sur HUBRISE_CLIENT_SECRET)
+HUBRISE_WEBHOOK_SECRET = os.getenv("HUBRISE_WEBHOOK_SECRET", "") or HUBRISE_CLIENT_SECRET
 
 if not WHATSAPP_APP_SECRET:
     _logger.warning(
@@ -99,6 +106,47 @@ CACHE_TTL_SECONDS = 300
 _config_cache: dict = {}
 _cache_timestamps: dict = {}
 _cache_lock = threading.Lock()
+
+
+# =============================================================================
+# DÉCORATEUR — @error_monitor : alertes critiques sur les routes Flask
+# =============================================================================
+
+def error_monitor(func):
+    """
+    Décorateur Flask : capture toute exception non gérée dans une route,
+    envoie une alerte Telegram immédiate et retourne un 500 propre.
+
+    Usage :
+        @app.route("/webhook", methods=["POST"])
+        @error_monitor
+        def whatsapp_webhook():
+            ...
+
+    L'alerte Telegram est envoyée en thread daemon (non-bloquant).
+    Le message inclut : nom de la route, type d'exception, traceback tronqué.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            route_name = func.__name__
+            tb_body    = format_exception_alert(exc, context=f"route={route_name}")
+            send_alert_async(
+                title=f"Erreur critique — {route_name}",
+                body=tb_body,
+                level="critical",
+                extra={
+                    "route":     route_name,
+                    "exception": f"{type(exc).__name__}: {exc}",
+                    "method":    request.method,
+                    "path":      request.path,
+                },
+            )
+            _logger.exception("💥 [error_monitor] Exception non gérée dans '%s'", route_name)
+            return jsonify({"error": "internal_server_error"}), 500
+    return wrapper
 
 
 def _cache_get(snack_id: str) -> Optional[dict]:
@@ -386,7 +434,40 @@ def _verify_meta_signature() -> bool:
     return hmac.compare_digest(sig_header[7:], expected)
 
 
+def _verify_hubrise_signature() -> bool:
+    """
+    Vérifie la signature X-Hub-Signature envoyée par HubRise (HMAC-SHA256).
+
+    HubRise signe le corps de la requête avec le client_secret (ou un webhook secret
+    dédié si configuré via HUBRISE_WEBHOOK_SECRET) et envoie la valeur dans le header
+    X-Hub-Signature au format "sha256=<hex_digest>".
+    """
+    if not HUBRISE_WEBHOOK_SECRET:
+        _env = os.getenv("FLASK_ENV", "production").lower()
+        if _env not in ("development", "testing"):
+            _logger.error(
+                "🚫 HUBRISE_WEBHOOK_SECRET non configuré — requête rejetée. "
+                "Définissez HUBRISE_WEBHOOK_SECRET (ou HUBRISE_CLIENT_SECRET) dans .env."
+            )
+            return False
+        _logger.warning("⚠️  Signature HubRise DÉSACTIVÉE (FLASK_ENV=%s). Ne jamais utiliser en production.", _env)
+        return True
+
+    sig_header = request.headers.get("X-Hub-Signature", "")
+    if not sig_header.startswith("sha256="):
+        _logger.warning("⚠️  [HUBRISE_WEBHOOK] Header X-Hub-Signature absent ou malformé.")
+        return False
+
+    expected = hmac.HMAC(
+        HUBRISE_WEBHOOK_SECRET.encode("utf-8"),
+        request.data,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(sig_header[7:], expected)
+
+
 @app.route("/webhook", methods=["POST"])
+@error_monitor
 def whatsapp_webhook():
     """
     Reçoit et traite les messages WhatsApp entrants (payload réel Meta).
@@ -538,6 +619,12 @@ def _handle_manager_callback(
             snack_name=nom_resto,
         )
         hubrise_ok = "error" not in hubrise_result and not hubrise_result.get("skipped")
+
+        # Persiste le lien commande interne ↔ commande HubRise pour le webhook /hubrise/webhook
+        if hubrise_result.get("status") == "created":
+            hr_order_id = hubrise_result.get("hubrise_order_id", "")
+            if hr_order_id:
+                link_hubrise_order(order_id, hr_order_id)
 
         # Notification client
         items_txt = "\n".join(
@@ -748,6 +835,7 @@ def _process_new_order(
 # =============================================================================
 
 @app.route("/admin/gdpr/delete", methods=["POST"])
+@error_monitor
 def admin_gdpr_delete():
     """
     Endpoint admin RGPD : suppression manuelle des données d'un client (Art. 17).
@@ -813,6 +901,7 @@ def hubrise_connect():
 # =============================================================================
 
 @app.route("/hubrise/callback", methods=["GET"])
+@error_monitor
 def hubrise_callback():
     """
     Callback OAuth2 HubRise.
@@ -912,7 +1001,252 @@ def hubrise_callback():
 
 
 # =============================================================================
-# ROUTE 5 : GET /health — Health check
+# ROUTE 5 : POST /hubrise/webhook — Notifications de statut HubRise
+# =============================================================================
+
+@app.route("/hubrise/webhook", methods=["POST"])
+@error_monitor
+def hubrise_status_webhook():
+    """
+    Reçoit les événements de changement de statut de commande depuis HubRise.
+
+    Lorsqu'une commande passe au statut "ready" (prête à être récupérée),
+    ce endpoint :
+      1. Vérifie la signature HMAC-SHA256 (X-Hub-Signature).
+      2. Retrouve le numéro client via hubrise_order_id dans la table orders.
+      3. Envoie un message WhatsApp au client pour l'informer.
+      4. Met à jour le statut de la commande en "ready" dans Supabase.
+
+    Payload HubRise attendu :
+        {
+            "event_type":  "order.updated",
+            "resource_id": "<hubrise_order_id>",
+            "resource": {
+                "id":     "<hubrise_order_id>",
+                "status": "ready",
+                ...
+            }
+        }
+
+    Note : HubRise utilise "awaiting_collection" comme statut natif pour
+    "prête à récupérer". Si votre configuration HubRise renvoie ce statut,
+    mettez à jour HUBRISE_READY_STATUS dans .env (défaut : "awaiting_collection").
+    """
+    # ── Vérification signature HubRise ───────────────────────────────────────
+    if not _verify_hubrise_signature():
+        _logger.warning("🚫 [HUBRISE_WEBHOOK] Signature X-Hub-Signature invalide — requête rejetée.")
+        return jsonify({"error": "Invalid signature"}), 403
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    event_type = data.get("event_type", "")
+    resource   = data.get("resource", {})
+
+    # ── Routage par type d'événement ─────────────────────────────────────────
+    if event_type == "catalog.updated":
+        return _handle_catalog_updated(data)
+
+    # ── Filtrage : uniquement order.updated ──────────────────────────────────
+    if event_type != "order.updated":
+        return jsonify({"status": "ignored", "reason": f"event_type={event_type}"}), 200
+
+    # ── Filtrage : statut "ready" (ou "awaiting_collection" selon config HubRise)
+    hubrise_ready_status = os.getenv("HUBRISE_READY_STATUS", "awaiting_collection")
+    new_status = resource.get("status", "")
+    if new_status not in (hubrise_ready_status, "ready"):
+        return jsonify({"status": "ignored", "reason": f"status={new_status}"}), 200
+
+    # ── Récupération de l'ID HubRise ─────────────────────────────────────────
+    hubrise_order_id = (
+        resource.get("id", "")
+        or data.get("resource_id", "")
+    ).strip()
+
+    if not hubrise_order_id:
+        _logger.warning("⚠️  [HUBRISE_WEBHOOK] resource.id manquant dans le payload.")
+        return jsonify({"error": "missing resource id"}), 400
+
+    # ── Lookup commande interne par hubrise_order_id ──────────────────────────
+    order = get_order_by_hubrise_id(hubrise_order_id)
+    if not order:
+        _logger.warning(
+            "⚠️  [HUBRISE_WEBHOOK] Aucune commande liée à hubrise_order_id=%s — "
+            "la commande a peut-être été créée avant la migration 005 ou hors SnackFlow.",
+            hubrise_order_id,
+        )
+        # On retourne 200 pour éviter les retries HubRise inutiles
+        return jsonify({"status": "not_linked", "hubrise_order_id": hubrise_order_id}), 200
+
+    customer_phone = order.get("customer_phone", "").strip()
+    snack_id       = str(order.get("snack_id", "")).strip()
+    internal_id    = str(order.get("id", "")).strip()
+
+    if not customer_phone:
+        _logger.error(
+            "❌ [HUBRISE_WEBHOOK] customer_phone absent pour order=%s — notification annulée.",
+            internal_id,
+        )
+        return jsonify({"status": "no_phone", "order_id": internal_id}), 200
+
+    # ── Récupération config snack (nom + credentials WhatsApp) ───────────────
+    try:
+        config = get_snack_config(snack_id)
+    except Exception as exc:
+        _logger.error("❌ [HUBRISE_WEBHOOK] get_snack_config(%s) : %s", snack_id, exc)
+        return jsonify({"error": "snack_config_unavailable"}), 200
+
+    nom_resto = (config.get("nom_resto") or config.get("name", "votre snack")).strip()
+
+    # ── Notification WhatsApp client ─────────────────────────────────────────
+    wa_result = send_text_message(
+        config,
+        customer_phone,
+        f"Bonne nouvelle ! Votre commande chez {nom_resto} est prête. "
+        "Vous pouvez venir la récupérer !",
+    )
+    wa_ok = "error" not in wa_result
+
+    # ── Mise à jour statut Supabase → ready ───────────────────────────────────
+    db_result = update_order_status(order_id=internal_id, status="ready", snack_id=snack_id)
+
+    _logger.info(
+        "✅ [HUBRISE_WEBHOOK] ready | hubrise_id=%s | phone=%s | wa=%s | db=%s",
+        hubrise_order_id,
+        _redact(customer_phone),
+        "ok" if wa_ok else "err",
+        db_result.get("status"),
+    )
+
+    return jsonify({"status": "processed", "wa_sent": wa_ok}), 200
+
+
+# =============================================================================
+# HANDLER INTERNE — catalog.updated (appelé depuis hubrise_status_webhook)
+# =============================================================================
+
+def _handle_catalog_updated(data: dict):
+    """
+    Traite l'événement HubRise 'catalog.updated'.
+
+    Déclenche une synchronisation de stock complète pour le snack concerné :
+      1. Identifie le snack via location_id dans le payload HubRise.
+      2. Appelle sync_stock_with_supabase() → met à jour menu_data._out_of_stock.
+      3. Envoie une alerte Telegram informative si des ruptures sont détectées.
+    """
+    location_id = (
+        data.get("location_id")
+        or (data.get("resource") or {}).get("location_id")
+        or ""
+    ).strip()
+
+    if not location_id:
+        _logger.warning("⚠️  [catalog.updated] location_id absent du payload — sync ignorée.")
+        return jsonify({"status": "ignored", "reason": "missing location_id"}), 200
+
+    # Retrouver le snack via son location_id HubRise
+    try:
+        sb       = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_SNACKS)
+            .select("id, name")
+            .eq("hubrise_location_id", location_id)
+            .single()
+            .execute()
+        )
+        snack_row = response.data
+    except Exception as exc:
+        _logger.error("❌ [catalog.updated] Lookup snack par location_id=%s : %s", location_id, exc)
+        return jsonify({"status": "error", "message": "snack_lookup_failed"}), 200
+
+    if not snack_row:
+        _logger.warning(
+            "⚠️  [catalog.updated] Aucun snack trouvé pour location_id=%s.", location_id
+        )
+        return jsonify({"status": "ignored", "reason": "snack_not_found"}), 200
+
+    snack_id   = str(snack_row.get("id", ""))
+    snack_name = snack_row.get("name", snack_id)
+
+    _logger.info("🔄 [catalog.updated] Sync stock → snack=%s (%s)", snack_name, snack_id)
+
+    result = sync_stock_with_supabase(snack_id)
+
+    if result.get("status") == "synced" and result.get("unavailable_count", 0) > 0:
+        send_alert_async(
+            title=f"Stock mis à jour — {snack_name}",
+            body=(
+                f"{result['unavailable_count']} produit(s) en rupture de stock détecté(s) "
+                f"et masqué(s) dans le catalogue Gemini.\n\n"
+                f"Produits indisponibles :\n"
+                + "\n".join(f"  • {p}" for p in result["unavailable_products"])
+            ),
+            level="warning",
+            extra={"snack": snack_name, "location_id": location_id},
+        )
+
+    _logger.info(
+        "✅ [catalog.updated] snack=%s | status=%s | ruptures=%d",
+        snack_name, result.get("status"), result.get("unavailable_count", 0),
+    )
+    return jsonify(result), 200
+
+
+# =============================================================================
+# ROUTE 6 : POST /admin/sync-stock — Synchronisation stock manuelle / cron
+# =============================================================================
+
+@app.route("/admin/sync-stock", methods=["POST"])
+@error_monitor
+def admin_sync_stock():
+    """
+    Déclenche manuellement la synchronisation du stock HubRise → Supabase.
+
+    Peut être appelé :
+      - Manuellement depuis le dashboard admin.
+      - Par une tâche cron (exemple curl) :
+            curl -s -X POST https://api.menudirect.fr/admin/sync-stock \\
+                 -H "Authorization: Bearer <ADMIN_API_KEY>" \\
+                 -H "Content-Type: application/json" \\
+                 -d '{"snack_id": "<uuid>"}'
+      - Par un scheduler externe (GitHub Actions, Railway cron, etc.)
+
+    Requiert : Authorization: Bearer <ADMIN_API_KEY>
+    Body JSON : { "snack_id": "<uuid>" }           → sync un seul snack
+             ou {}                                  → sync tous les snacks actifs
+
+    Réponse : {"results": [{snack_id, status, unavailable_count, ...}]}
+    """
+    # ── Auth admin ───────────────────────────────────────────────────────────
+    auth_header = request.headers.get("Authorization", "")
+    if not ADMIN_API_KEY or auth_header != f"Bearer {ADMIN_API_KEY}":
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body     = request.get_json(force=True, silent=True) or {}
+    snack_id = body.get("snack_id", "").strip()
+
+    if snack_id:
+        # Sync d'un seul snack
+        result  = sync_stock_with_supabase(snack_id)
+        results = [{"snack_id": snack_id, **result}]
+    else:
+        # Sync de tous les snacks actifs
+        from layer3_tools.supabase_tool import list_all_snacks
+        snacks  = list_all_snacks()
+        results = []
+        for snack in snacks:
+            sid = str(snack.get("id", ""))
+            if not sid:
+                continue
+            r = sync_stock_with_supabase(sid)
+            results.append({"snack_id": sid, "name": snack.get("name"), **r})
+
+    synced_count = sum(1 for r in results if r.get("status") == "synced")
+    _logger.info("✅ [admin/sync-stock] %d/%d snack(s) synchronisé(s).", synced_count, len(results))
+    return jsonify({"synced": synced_count, "total": len(results), "results": results}), 200
+
+
+# =============================================================================
+# ROUTE 7 : GET /health — Health check
 # =============================================================================
 
 @app.route("/health", methods=["GET"])

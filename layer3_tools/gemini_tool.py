@@ -272,7 +272,10 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
                 f"\n\nVoici le catalogue officiel du snack : {menu_str}. "
                 "Ta mission est de mapper les envies du client EXCLUSIVEMENT sur les produits de ce catalogue. "
                 "Si un produit demandé n'existe pas dans le catalogue, l'extraction doit quand même se faire, "
-                "mais tu dois l'indiquer explicitement dans le champ customer_notes."
+                "mais tu dois l'indiquer explicitement dans le champ customer_notes. "
+                "IMPORTANT : si le catalogue contient une clé '_out_of_stock', les produits listés "
+                "sont en rupture de stock — tu NE DOIS PAS les inclure dans la commande. "
+                "Informe le client dans customer_notes si son article est indisponible."
             )
 
         # Structured Output : Gemini retourne directement un JSON conforme au schéma
@@ -392,7 +395,9 @@ def generate_upsell_skill(order_data: HubRiseOrder, menu_context: dict = None) -
             sys_prompt += (
                 f"\n\nVoici le catalogue officiel du snack : {menu_str}. "
                 "L'article que tu suggères DOIT ÊTRE présent dans ce catalogue. "
-                "Ne suggère jamais un produit générique s'il n'est pas explicitement listé."
+                "Ne suggère jamais un produit générique s'il n'est pas explicitement listé. "
+                "IMPORTANT : si le catalogue contient une clé '_out_of_stock', "
+                "ne suggère JAMAIS un produit figurant dans cette liste — il est en rupture de stock."
             )
 
         model = genai.GenerativeModel(

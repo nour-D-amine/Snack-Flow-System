@@ -29,6 +29,7 @@ Principes :
   - Mapping Gemini → HubRise : name, qty, price avec defaults sûrs.
 """
 
+import copy
 import logging
 from typing import Optional
 
@@ -203,3 +204,199 @@ def push_to_hubrise(
     except Exception as exc:
         logger.error("💥 [HubRise] Erreur inattendue : %s", exc)
         return {"status": "error", "message": str(exc)}
+
+
+# =============================================================================
+# SYNCHRONISATION STOCK — HubRise Catalog → Supabase menu_data
+# =============================================================================
+
+def _get_catalog_for_location(access_token: str, location_id: str) -> Optional[dict]:
+    """
+    Récupère le catalogue HubRise associé à un établissement.
+
+    Flux en deux appels :
+      1. GET /locations/{location_id}  → extrait l'id du catalogue lié
+      2. GET /catalogs/{catalog_id}    → retourne le catalogue complet
+
+    :return: Dictionnaire du catalogue HubRise ou None en cas d'erreur.
+    """
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type":  "application/json",
+    }
+
+    # ── Étape 1 : récupération de l'id du catalogue via la location ──────────
+    try:
+        loc_resp = requests.get(
+            f"{HUBRISE_API_BASE}/locations/{location_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if loc_resp.status_code != 200:
+            logger.error(
+                "❌ [HubRise] GET /locations/%s → HTTP %s", location_id, loc_resp.status_code
+            )
+            return None
+
+        loc_data   = loc_resp.json()
+        # HubRise retourne soit {"catalog": {"id": "..."}} soit {"catalog_id": "..."}
+        catalog_id = (
+            loc_data.get("catalog_id")
+            or (loc_data.get("catalog") or {}).get("id")
+        )
+
+        if not catalog_id:
+            logger.warning(
+                "⚠️  [HubRise] Aucun catalogue lié à la location '%s'.", location_id
+            )
+            return None
+
+    except requests.exceptions.Timeout:
+        logger.error("⏱️  [HubRise] Timeout lors de GET /locations/%s", location_id)
+        return None
+    except Exception as exc:
+        logger.error("💥 [HubRise] Erreur GET /locations/%s : %s", location_id, exc)
+        return None
+
+    # ── Étape 2 : récupération du catalogue complet ───────────────────────────
+    try:
+        cat_resp = requests.get(
+            f"{HUBRISE_API_BASE}/catalogs/{catalog_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if cat_resp.status_code != 200:
+            logger.error(
+                "❌ [HubRise] GET /catalogs/%s → HTTP %s", catalog_id, cat_resp.status_code
+            )
+            return None
+
+        logger.info("✅ [HubRise] Catalogue récupéré (id=%s)", catalog_id)
+        return cat_resp.json()
+
+    except requests.exceptions.Timeout:
+        logger.error("⏱️  [HubRise] Timeout lors de GET /catalogs/%s", catalog_id)
+        return None
+    except Exception as exc:
+        logger.error("💥 [HubRise] Erreur GET /catalogs/%s : %s", catalog_id, exc)
+        return None
+
+
+def _extract_unavailable_products(catalog: dict) -> list:
+    """
+    Extrait les noms des produits indisponibles depuis un catalogue HubRise.
+
+    Un produit est considéré indisponible si TOUS ses SKUs ont `available: false`.
+    Cette règle évite de masquer un produit qui a encore une variante disponible.
+
+    :param catalog: Dictionnaire retourné par GET /catalogs/{id}.
+    :return: Liste de noms de produits indisponibles (strings).
+    """
+    products    = catalog.get("data", {}).get("products", [])
+    unavailable = []
+
+    for product in products:
+        skus = product.get("skus", [])
+        if not skus:
+            continue
+
+        all_unavailable = all(not sku.get("available", True) for sku in skus)
+        if all_unavailable:
+            name = product.get("name", "").strip()
+            ref  = product.get("ref", "").strip()
+            # Priorité au nom (plus lisible pour Gemini), fallback sur ref
+            label = name or ref
+            if label:
+                unavailable.append(label)
+
+    logger.info(
+        "📦 [HubRise] Stock sync : %d produit(s) indisponible(s) détecté(s).", len(unavailable)
+    )
+    return unavailable
+
+
+def _merge_stock_into_menu_data(menu_data: Optional[dict], unavailable: list) -> dict:
+    """
+    Injecte la liste de rupture de stock dans menu_data sans altérer la structure existante.
+
+    Ajoute ou remplace UNIQUEMENT la clé '_out_of_stock' (liste de noms).
+    Toutes les autres clés (catégories, produits, prix, etc.) sont préservées à l'identique.
+
+    :param menu_data:    Catalogue JSONB existant (peut être None).
+    :param unavailable:  Liste de noms de produits indisponibles.
+    :return: Copie profonde de menu_data avec '_out_of_stock' mis à jour.
+    """
+    updated = copy.deepcopy(menu_data) if menu_data else {}
+    updated["_out_of_stock"] = unavailable
+    return updated
+
+
+def sync_stock_with_supabase(snack_id: str) -> dict:
+    """
+    Synchronise la disponibilité des produits HubRise vers Supabase (menu_data).
+
+    Flux complet :
+      1. Récupère les credentials HubRise depuis Supabase (access_token, location_id).
+      2. Appelle l'API HubRise /catalog pour ce snack.
+      3. Identifie les produits avec available=false sur tous leurs SKUs.
+      4. Met à jour menu_data._out_of_stock dans Supabase — sans toucher au reste du catalogue.
+
+    Gemini respecte automatiquement cette liste via son system prompt
+    (voir parse_order_skill et generate_upsell_skill dans gemini_tool.py).
+
+    :param snack_id: UUID du restaurant (table snacks).
+    :return: {
+        "status":               "synced" | "skipped" | "error",
+        "unavailable_count":    int,
+        "unavailable_products": list[str],
+        "db_update":            dict,
+    }
+    """
+    # Import local pour éviter la dépendance circulaire hubrise_tool ↔ supabase_tool
+    from layer3_tools.supabase_tool import get_snack_config, update_snack_menu_data
+
+    # ── Étape 1 : récupération des credentials ────────────────────────────────
+    try:
+        config = get_snack_config(snack_id)
+    except Exception as exc:
+        logger.error("❌ [StockSync] get_snack_config(%s) : %s", snack_id, exc)
+        return {"status": "error", "message": f"Snack introuvable : {exc}"}
+
+    access_token = str(config.get("hubrise_access_token") or "").strip()
+    location_id  = str(config.get("hubrise_location_id")  or "").strip()
+
+    if not access_token or not location_id:
+        msg = (
+            f"Credentials HubRise absents pour snack '{snack_id}'. "
+            "Connectez HubRise via /hubrise/connect."
+        )
+        logger.warning("⚠️  [StockSync] %s", msg)
+        return {"status": "skipped", "message": msg}
+
+    # ── Étape 2 : récupération du catalogue ───────────────────────────────────
+    catalog = _get_catalog_for_location(access_token, location_id)
+    if catalog is None:
+        return {
+            "status":  "error",
+            "message": "Catalogue HubRise indisponible (voir logs pour détails).",
+        }
+
+    # ── Étape 3 : extraction des produits indisponibles ───────────────────────
+    unavailable = _extract_unavailable_products(catalog)
+
+    # ── Étape 4 : mise à jour Supabase ────────────────────────────────────────
+    current_menu_data = config.get("menu_data")
+    updated_menu_data = _merge_stock_into_menu_data(current_menu_data, unavailable)
+    db_result         = update_snack_menu_data(snack_id, updated_menu_data)
+
+    logger.info(
+        "✅ [StockSync] snack=%s | indisponibles=%d | db=%s",
+        snack_id, len(unavailable), db_result.get("status"),
+    )
+
+    return {
+        "status":               "synced",
+        "unavailable_count":    len(unavailable),
+        "unavailable_products": unavailable,
+        "db_update":            db_result,
+    }

@@ -224,6 +224,37 @@ def get_snack_config(snack_id: str) -> dict:
         raise
 
 
+def update_snack_menu_data(snack_id: str, menu_data: dict) -> dict:
+    """
+    Met à jour le champ menu_data (JSONB) d'un restaurant dans la table 'snacks'.
+
+    Utilisé par sync_stock_with_supabase() pour propager les disponibilités
+    HubRise vers le catalogue Gemini sans toucher aux autres colonnes du snack.
+
+    :param snack_id:  UUID du restaurant (PK snacks.id).
+    :param menu_data: Dictionnaire complet du catalogue (structure libre JSONB).
+                      La clé '_out_of_stock' sera ajoutée/mise à jour par la sync.
+    :return: {"status": "success"} ou {"status": "error", "message": str}.
+    """
+    if not snack_id:
+        return {"status": "error", "message": "snack_id requis"}
+    try:
+        sb = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_SNACKS)
+            .update({"menu_data": menu_data})
+            .eq("id", snack_id.strip())
+            .execute()
+        )
+        result = response.data[0] if response.data else {"id": snack_id}
+        logger.info("✅ update_snack_menu_data : snack=%s | _out_of_stock=%s",
+                    snack_id, menu_data.get("_out_of_stock", []))
+        return {"status": "success", "row": result}
+    except Exception as e:
+        logger.error("❌ update_snack_menu_data(%s) : %s", snack_id, e)
+        return {"status": "error", "message": str(e)}
+
+
 def list_all_snacks() -> list:
     """
     Retourne la liste de tous les restaurants actifs depuis la table 'snacks'.
@@ -407,7 +438,7 @@ def log_order(
     :return: Ligne insérée ou dict d'erreur.
     """
     # Validation des valeurs status acceptées par la contrainte CHECK
-    _valid_statuses = {"pending", "confirmed", "failed", "cancelled"}
+    _valid_statuses = {"pending", "confirmed", "ready", "failed", "cancelled"}
     if status not in _valid_statuses:
         logger.warning("⚠️  log_order : statut invalide '%s' → forcé à 'pending'", status)
         status = "pending"
@@ -442,7 +473,7 @@ def update_order_status(order_id: str, status: str, snack_id: str = "") -> dict:
     :param snack_id: (optionnel) UUID du tenant — filtre de sécurité multi-tenant.
     :return: Ligne mise à jour ou dict d'erreur.
     """
-    _valid_statuses = {"pending", "confirmed", "failed", "cancelled"}
+    _valid_statuses = {"pending", "confirmed", "ready", "failed", "cancelled"}
     if status not in _valid_statuses:
         logger.warning("⚠️  update_order_status : statut invalide '%s' → forcé à 'pending'", status)
         status = "pending"
@@ -482,6 +513,62 @@ def get_order_by_id(order_id: str, snack_id: str = "") -> Optional[dict]:
     except Exception as e:
         logger.error("❌ get_order_by_id(%s) : %s", order_id, e)
         return None
+
+
+def get_order_by_hubrise_id(hubrise_order_id: str) -> Optional[dict]:
+    """
+    Retrouve une commande interne via son identifiant HubRise.
+
+    Utilisé par le webhook /hubrise/webhook pour relier l'événement HubRise
+    au numéro de téléphone client stocké dans Supabase.
+
+    :param hubrise_order_id: Identifiant de commande côté HubRise (ex: "abc123").
+    :return: Dict de la commande (incl. customer_phone, snack_id) ou None si introuvable.
+    """
+    if not hubrise_order_id:
+        return None
+    try:
+        sb = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_ORDERS)
+            .select("*")
+            .eq("hubrise_order_id", hubrise_order_id.strip())
+            .single()
+            .execute()
+        )
+        return response.data or None
+    except Exception as e:
+        logger.error("❌ get_order_by_hubrise_id(%s) : %s", hubrise_order_id, e)
+        return None
+
+
+def link_hubrise_order(order_id: str, hubrise_order_id: str) -> dict:
+    """
+    Enregistre l'identifiant HubRise sur une commande Supabase existante.
+
+    Appelé après un push_to_hubrise réussi pour maintenir le lien
+    commande interne ↔ commande HubRise, nécessaire au webhook /hubrise/webhook.
+
+    :param order_id:         UUID interne de la commande (table orders).
+    :param hubrise_order_id: Identifiant retourné par l'API HubRise.
+    :return: {"status": "success"} ou {"status": "error", "message": str}.
+    """
+    if not order_id or not hubrise_order_id:
+        return {"status": "error", "message": "order_id et hubrise_order_id sont requis"}
+    try:
+        sb = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_ORDERS)
+            .update({"hubrise_order_id": hubrise_order_id.strip()})
+            .eq("id", order_id.strip())
+            .execute()
+        )
+        result = response.data[0] if response.data else {"id": order_id}
+        logger.info("✅ link_hubrise_order : order=%s → hubrise_id=%s", order_id, hubrise_order_id)
+        return {"status": "success", "row": result}
+    except Exception as e:
+        logger.error("❌ link_hubrise_order(%s, %s) : %s", order_id, hubrise_order_id, e)
+        return {"status": "error", "message": str(e)}
 
 
 def get_orders(snack_id: str, limit: int = 100) -> list:
