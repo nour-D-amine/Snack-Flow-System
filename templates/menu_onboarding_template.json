@@ -1,0 +1,61 @@
+{
+  "categories": [
+    {
+      "name": "Burgers",
+      "items": [
+        {
+          "name": "Burger Classique",
+          "price": "8.50 EUR",
+          "options": [
+            "Sans oignon",
+            "Extra Sauce",
+            "Double fromage"
+          ]
+        },
+        {
+          "name": "Cheeseburger Menu",
+          "price": "12.00 EUR"
+        }
+      ]
+    },
+    {
+      "name": "Accompagnements",
+      "items": [
+        {
+          "name": "Frites Maison",
+          "price": "3.50 EUR"
+        },
+        {
+          "name": "Onion Rings (x6)",
+          "price": "4.00 EUR"
+        }
+      ]
+    },
+    {
+      "name": "Boissons",
+      "items": [
+        {
+          "name": "Coca-Cola 33cl",
+          "price": "2.00 EUR"
+        },
+        {
+          "name": "Limonade Artisanale",
+          "price": "3.50 EUR"
+        }
+      ]
+    },
+    {
+      "name": "Desserts",
+      "items": [
+        {
+          "name": "Tiramisu Spéculoos",
+          "price": "4.50 EUR"
+        },
+        {
+          "name": "Cheesecake",
+          "price": "5.00 EUR"
+        }
+      ]
+    }
+  ]
+}

@@ -236,7 +236,7 @@ _ORDER_PARSER_GENERATION_CONFIG = {
 }
 
 
-def parse_order_skill(user_text: str) -> HubRiseOrder:
+def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder:
     """
     SKILL 1 — Order Parser.
 
@@ -244,6 +244,7 @@ def parse_order_skill(user_text: str) -> HubRiseOrder:
     Utilise les Structured Outputs de Gemini : zéro regex, zéro json.loads manuel.
 
     :param user_text: Texte brut du message WhatsApp client.
+    :param menu_context: Dictionnaire optionnel représentant le catalogue produit du snack.
     :return: HubRiseOrder validé par Pydantic.
              Fallback : HubRiseOrder avec un item encapsulé si Gemini indisponible.
 
@@ -263,10 +264,21 @@ def parse_order_skill(user_text: str) -> HubRiseOrder:
     try:
         genai = _get_genai()
 
+        # Construction dynamique du System Prompt
+        sys_prompt = _ORDER_PARSER_SYSTEM
+        if menu_context:
+            menu_str = json.dumps(menu_context, ensure_ascii=False)
+            sys_prompt += (
+                f"\n\nVoici le catalogue officiel du snack : {menu_str}. "
+                "Ta mission est de mapper les envies du client EXCLUSIVEMENT sur les produits de ce catalogue. "
+                "Si un produit demandé n'existe pas dans le catalogue, l'extraction doit quand même se faire, "
+                "mais tu dois l'indiquer explicitement dans le champ customer_notes."
+            )
+
         # Structured Output : Gemini retourne directement un JSON conforme au schéma
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
-            system_instruction=_ORDER_PARSER_SYSTEM,
+            system_instruction=sys_prompt,
         )
 
         response = model.generate_content(
@@ -346,7 +358,7 @@ _UPSELL_GENERATION_CONFIG = {
 }
 
 
-def generate_upsell_skill(order_data: HubRiseOrder) -> Optional[UpsellSuggestion]:
+def generate_upsell_skill(order_data: HubRiseOrder, menu_context: dict = None) -> Optional[UpsellSuggestion]:
     """
     SKILL 2 — Logical Upseller.
 
@@ -355,6 +367,7 @@ def generate_upsell_skill(order_data: HubRiseOrder) -> Optional[UpsellSuggestion
     Objectif : augmentation pure du panier moyen (AOV).
 
     :param order_data: HubRiseOrder produit par parse_order_skill.
+    :param menu_context: Dictionnaire optionnel représentant le catalogue produit du snack.
     :return: UpsellSuggestion ou None si panier vide / Gemini indisponible.
     """
     if not order_data or order_data.is_empty():
@@ -372,9 +385,19 @@ def generate_upsell_skill(order_data: HubRiseOrder) -> Optional[UpsellSuggestion
     try:
         genai = _get_genai()
 
+        # Construction dynamique du System Prompt
+        sys_prompt = _UPSELL_SYSTEM
+        if menu_context:
+            menu_str = json.dumps(menu_context, ensure_ascii=False)
+            sys_prompt += (
+                f"\n\nVoici le catalogue officiel du snack : {menu_str}. "
+                "L'article que tu suggères DOIT ÊTRE présent dans ce catalogue. "
+                "Ne suggère jamais un produit générique s'il n'est pas explicitement listé."
+            )
+
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
-            system_instruction=_UPSELL_SYSTEM,
+            system_instruction=sys_prompt,
         )
 
         response = model.generate_content(

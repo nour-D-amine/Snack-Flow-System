@@ -170,6 +170,11 @@ def get_snack_config(snack_id: str) -> dict:
             config.get("resto_phone")
             or os.getenv("RESTO_PHONE", "")
         )
+        # menu_data : catalogue dynamique JSONB
+        config["menu_data"]         = config.get("menu_data")
+        if not config["menu_data"]:
+            logger.info("ℹ️  [Onboarding] menu_data vide pour le snack '%s' — Gemini n'aura pas de catalogue dynamique.", sid)
+
         return config
 
     try:

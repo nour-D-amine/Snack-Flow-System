@@ -617,10 +617,13 @@ def _process_new_order(
     # ── Étape 2a : SKILL 1 — OrderParser (texte → HubRiseOrder) ─────────────
     from layer3_tools.gemini_tool import HubRiseOrder  # import local pour éviter cycle
     order_data: HubRiseOrder = HubRiseOrder(items=[])  # défaut sécurisé
+    
+    # Catalogue produit pour les Skills
+    menu_data = config.get("menu_data")
 
     if message_type == "text" and message_text:
         try:
-            order_data = parse_order_skill(message_text)
+            order_data = parse_order_skill(message_text, menu_context=menu_data)
             print(
                 f"✅ [SKILL1] OrderParser → {len(order_data.items)} article(s) "
                 f"| {[it.product_name for it in order_data.items]}"
@@ -631,7 +634,7 @@ def _process_new_order(
     # ── Étape 2b : SKILL 2 — LogicalUpseller (panier → suggestion AOV) ──────
     upsell = None
     try:
-        upsell = generate_upsell_skill(order_data)
+        upsell = generate_upsell_skill(order_data, menu_context=menu_data)
         if upsell:
             print(
                 f"✅ [SKILL2] Upsell → '{upsell.suggested_item}' | "
