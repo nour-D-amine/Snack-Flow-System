@@ -35,7 +35,7 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-SERVER_PORT            = int(os.getenv("SERVER_PORT", "5001"))
+SERVER_PORT            = int(os.getenv("PORT", os.getenv("SERVER_PORT", "5001")))
 SERVER_HOST            = os.getenv("SERVER_HOST", "0.0.0.0")
 HEALTH_CHECK_INTERVAL  = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))  # secondes
 
