@@ -51,6 +51,7 @@ logger.setLevel(logging.INFO)
 TABLE_SNACKS        = "snacks"
 TABLE_ORDERS        = "orders"
 TABLE_CUSTOMERS     = "customers"
+TABLE_CARTS         = "carts"
 
 # ─── Client Supabase (Singleton class) ────────────────────────────────────────
 
@@ -739,6 +740,82 @@ def health_check() -> dict:
         return {"status": "ok", "snacks_count": count}
     except Exception as e:
         logger.error("❌ Supabase health check FAILED : %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+# =============================================================================
+# CART — Persistance panier client (table carts)
+# Voir migration_carts.sql pour la création de la table.
+# PK composite (phone_e164, snack_id) : un panier actif par (client, snack).
+# =============================================================================
+
+def cart_upsert(phone_e164: str, snack_id: str, items: list, total_price: float = 0.0) -> dict:
+    """
+    Crée ou met à jour le panier d'un client dans la table 'carts'.
+
+    :param phone_e164:  Numéro client au format E.164.
+    :param snack_id:    UUID du restaurant.
+    :param items:       Liste d'articles [{"id": str, "name": str, "price": float, "qty": int}].
+    :param total_price: Total calculé (somme price * qty).
+    :return: {"status": "ok"} ou {"status": "error", "message": str}.
+    """
+    try:
+        sb  = SupabaseClient.instance()
+        row = {
+            "phone_e164":  phone_e164.strip(),
+            "snack_id":    snack_id.strip(),
+            "items":       items,
+            "total_price": round(float(total_price), 2),
+        }
+        sb.table(TABLE_CARTS).upsert(row, on_conflict="phone_e164,snack_id").execute()
+        logger.info("✅ cart_upsert : phone=%s | snack=%s | items=%d", phone_e164, snack_id, len(items))
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("❌ cart_upsert(%s, %s) : %s", phone_e164, snack_id, e)
+        return {"status": "error", "message": str(e)}
+
+
+def cart_get(phone_e164: str, snack_id: str) -> list:
+    """
+    Récupère la liste d'articles du panier actif d'un client.
+
+    :param phone_e164: Numéro client au format E.164.
+    :param snack_id:   UUID du restaurant.
+    :return: Liste d'articles ou [] si le panier est vide / introuvable.
+    """
+    try:
+        sb  = SupabaseClient.instance()
+        response = (
+            sb.table(TABLE_CARTS)
+            .select("items")
+            .eq("phone_e164", phone_e164.strip())
+            .eq("snack_id", snack_id.strip())
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return response.data[0].get("items", []) or []
+        return []
+    except Exception as e:
+        logger.error("❌ cart_get(%s, %s) : %s", phone_e164, snack_id, e)
+        return []
+
+
+def cart_clear(phone_e164: str, snack_id: str) -> dict:
+    """
+    Supprime le panier actif d'un client (après validation de la commande).
+
+    :param phone_e164: Numéro client au format E.164.
+    :param snack_id:   UUID du restaurant.
+    :return: {"status": "ok"} ou {"status": "error", "message": str}.
+    """
+    try:
+        sb = SupabaseClient.instance()
+        sb.table(TABLE_CARTS).delete().eq("phone_e164", phone_e164.strip()).eq("snack_id", snack_id.strip()).execute()
+        logger.info("✅ cart_clear : phone=%s | snack=%s", phone_e164, snack_id)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("❌ cart_clear(%s, %s) : %s", phone_e164, snack_id, e)
         return {"status": "error", "message": str(e)}
 
 

@@ -207,6 +207,119 @@ def push_to_hubrise(
 
 
 # =============================================================================
+# FINALISATION COMMANDE — Orchestration complète depuis panier Supabase
+# =============================================================================
+
+def finalize_cart_order(phone: str, config: dict) -> dict:
+    """
+    Orchestre la finalisation complète d'une commande client :
+      1. Récupère le panier depuis Supabase (cart_get)
+      2. Crée la commande dans Supabase (create_order, status=pending)
+      3. Pousse vers HubRise (push_to_hubrise)
+      4. Lie l'ID HubRise + met à jour status=confirmed
+      5. Envoie message WhatsApp de confirmation au client
+      6. Envoie notification Telegram au gérant
+      7. Vide le panier Supabase (cart_clear)
+
+    :param phone:  Numéro client au format E.164.
+    :param config: Dict issu de supabase_tool.get_snack_config().
+    :return: {"status": "ok"|"error", "hubrise_ok": bool, "order_id": str}
+    """
+    from layer3_tools.supabase_tool import (
+        cart_get, cart_clear, create_order, link_hubrise_order, update_order_status,
+    )
+    from layer3_tools.alert_tool import notify_telegram
+    from layer3_tools.whatsapp_tool import send_text_message
+
+    snack_id    = str(config.get("id") or config.get("snack_id", "")).strip()
+    nom_resto   = config.get("nom_resto") or config.get("name", "Le Snack")
+    hr_token    = str(config.get("hubrise_access_token", "") or "").strip()
+    hr_loc      = str(config.get("hubrise_location_id", "") or "").strip()
+
+    # 1. Récupérer le panier
+    items = cart_get(phone, snack_id)
+    if not items:
+        return {"status": "error", "message": "Panier vide"}
+
+    parsed_items = [
+        {"name": it["name"], "qty": it["qty"], "price": it.get("price")}
+        for it in items
+    ]
+
+    # 2. Créer la commande dans Supabase
+    order_id: Optional[str] = None
+    try:
+        res = create_order(
+            snack_id=snack_id,
+            data={"customer_phone": phone, "items": parsed_items, "status": "pending"},
+        )
+        order_id = res.get("row", {}).get("id")
+        logger.info("✅ finalize_cart_order : commande créée id=%s", order_id)
+    except Exception as e:
+        logger.error("❌ finalize_cart_order : create_order échoué : %s", e)
+        return {"status": "error", "message": str(e)}
+
+    # 3. Push HubRise
+    hubrise_ok = False
+    hubrise_id = ""
+    try:
+        hr_result = push_to_hubrise(
+            order={
+                "id":             order_id,
+                "customer_phone": phone,
+                "items":          parsed_items,
+                "status":         "pending",
+            },
+            access_token=hr_token,
+            location_id=hr_loc,
+            snack_name=nom_resto,
+        )
+        if hr_result.get("status") == "created":
+            hubrise_id = hr_result.get("hubrise_order_id", "")
+            link_hubrise_order(order_id, hubrise_id)
+            update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
+            hubrise_ok = True
+            logger.info("✅ finalize_cart_order : HubRise push OK | hr_id=%s", hubrise_id)
+        else:
+            logger.warning("⚠️  finalize_cart_order : HubRise push non créé : %s", hr_result)
+    except Exception as e:
+        logger.warning("⚠️  finalize_cart_order : push_to_hubrise échoué (non bloquant) : %s", e)
+
+    # 4. Résumé + total
+    summary_lines = [
+        f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
+        for it in items
+    ]
+    summary = "\n".join(summary_lines)
+    total   = sum((it.get("price") or 0) * it["qty"] for it in items)
+
+    # 5. WhatsApp → client
+    try:
+        hubrise_line = "\n🟢 *Commande transmise en cuisine.*" if hubrise_ok else ""
+        send_text_message(
+            config, phone,
+            f"🧾 *Récapitulatif :*\n\n{summary}{hubrise_line}\n\n"
+            f"✅ Merci chez _{nom_resto}_ 🙏",
+        )
+    except Exception as e:
+        logger.warning("⚠️  finalize_cart_order : WA client échoué : %s", e)
+
+    # 6. Telegram → gérant
+    hr_info = f"🟢 HubRise transmis (id: {hubrise_id[:8]}…)" if hubrise_ok else "⚠️ HubRise non transmis"
+    total_str = f"{total:.2f}€" if total > 0 else "non calculé"
+    notify_telegram(
+        f"🆕 <b>Nouvelle commande</b> — {nom_resto}\n"
+        f"Client : {phone}\n\n{summary}\n\n"
+        f"Total : {total_str}\n{hr_info}",
+    )
+
+    # 7. Vider le panier
+    cart_clear(phone, snack_id)
+
+    return {"status": "ok", "hubrise_ok": hubrise_ok, "order_id": order_id or ""}
+
+
+# =============================================================================
 # SYNCHRONISATION STOCK — HubRise Catalog → Supabase menu_data
 # =============================================================================
 

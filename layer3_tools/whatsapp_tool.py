@@ -352,13 +352,15 @@ def send_list_menu(
     button_text: str = "Voir le menu",
     header_text: str = "",
     footer_text: str = "",
+    logo_url: str = "",
 ) -> dict:
     """
     Envoie un message interactif de type 'list' (menu déroulant WhatsApp).
 
     Contraintes Meta :
       - button_text  : max 20 caractères
-      - header_text  : max 60 caractères
+      - header_text  : max 60 caractères (si text)
+      - logo_url     : URL HTTPS publique d'une image JPEG/PNG (si image header)
       - sections[].title    : max 24 caractères
       - rows[].id           : max 200 caractères
       - rows[].title        : max 24 caractères
@@ -408,7 +410,9 @@ def send_list_menu(
             "sections": safe_sections,
         },
     }
-    if header_text:
+    if logo_url:
+        interactive["header"] = {"type": "image", "image": {"link": logo_url.strip()}}
+    elif header_text:
         interactive["header"] = {"type": "text", "text": header_text[:60]}
     if footer_text:
         interactive["footer"] = {"text": footer_text[:60]}

@@ -56,15 +56,15 @@ from layer3_tools.supabase_tool import (
     get_snack_by_phone_id,
     upsert_customer,
     delete_customer_data,
-    create_order,
     update_order_status,
     get_order_by_id,
     get_order_by_hubrise_id,
     link_hubrise_order,
     health_check as supabase_health,
 )
-from layer3_tools.hubrise_tool import push_to_hubrise, sync_stock_with_supabase
-from layer3_tools.menu_manager import build_menu_sections, send_main_menu as _send_main_menu
+from layer3_tools.hubrise_tool import push_to_hubrise, sync_stock_with_supabase, finalize_cart_order
+from layer3_tools.menu_manager import build_menu_sections, send_interactive_menu as _send_main_menu
+from layer3_tools.supabase_tool import cart_upsert, cart_get, cart_clear
 from layer3_tools.alert_tool import send_alert_async, format_exception_alert
 from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
 
@@ -280,43 +280,17 @@ def _handle_deletion_request(config: dict, snack_id: str, customer_phone: str) -
 
 
 # =============================================================================
-# PANIER CLIENT — État en mémoire (thread-safe)
-# Note Railway : fonctionne en mode single-worker (1 Gunicorn worker).
-#   Si vous passez à plusieurs workers, migrez vers une table Supabase `carts`.
+# PANIER CLIENT — Persistance Supabase (table carts)
+# Survit aux redémarrages Railway — aucun état éphémère en mémoire.
+# Voir migration_carts.sql pour la création de la table.
 # =============================================================================
 
-_CARTS: dict      = {}   # {phone_e164: {"items": [...], "snack_id": str}}
-_CARTS_LOCK       = threading.Lock()
-
-# Format d'un item panier :
-#   {"id": str, "name": str, "price": float|None, "qty": int}
-
-def _cart_add(phone: str, snack_id: str, item_id: str, item_name: str, price: float = None) -> list:
-    """Ajoute ou incrémente un article dans le panier. Retourne la liste d'items."""
-    with _CARTS_LOCK:
-        cart = _CARTS.setdefault(phone, {"items": [], "snack_id": snack_id})
-        for existing in cart["items"]:
-            if existing["id"] == item_id:
-                existing["qty"] += 1
-                return list(cart["items"])
-        cart["items"].append({"id": item_id, "name": item_name, "price": price, "qty": 1})
-        return list(cart["items"])
-
-
-def _cart_get(phone: str) -> list:
-    with _CARTS_LOCK:
-        return list(_CARTS.get(phone, {}).get("items", []))
-
-
-def _cart_clear(phone: str) -> None:
-    with _CARTS_LOCK:
-        _CARTS.pop(phone, None)
-
-
-def _cart_summary(items: list) -> str:
+def _cart_summary_from_items(items: list) -> str:
     """Retourne une chaîne récapitulative du panier."""
-    lines = [f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
-             for it in items]
+    lines = [
+        f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
+        for it in items
+    ]
     return "\n".join(lines)
 
 
@@ -624,8 +598,9 @@ def _process_message(
     Point d'entrée du traitement asynchrone.
     Route vers :
       - _handle_manager_callback()  si gérant + button_id CONFIRM/REJECT/CALL
-      - _handle_cart_validate()     si button_id == "VALIDATE_CART"
-      - _send_main_menu()           si button_id == "ADD_MORE"
+      - _handle_cart_validate()     si button_id == "validate_order"
+      - _handle_view_cart()         si button_id == "view_cart"
+      - _send_main_menu()           si button_id == "add_more"
       - _handle_cart_item()         si interactive_type == "list_reply"
       - _process_new_order()        pour tous les autres messages texte
     """
@@ -647,15 +622,19 @@ def _process_message(
     ):
         _handle_manager_callback(button_id, from_phone, config, snack_id)
 
-    # 2. Validation du panier client
-    elif button_id == "VALIDATE_CART":
+    # 2. Validation finale du panier → push HubRise + notifications
+    elif button_id == "validate_order":
         _handle_cart_validate(snack_id, from_phone, config)
 
-    # 3. Le client veut ajouter un autre article
-    elif button_id == "ADD_MORE":
+    # 3. Voir le récapitulatif du panier
+    elif button_id == "view_cart":
+        _handle_view_cart(snack_id, from_phone, config)
+
+    # 4. Le client veut ajouter un autre article
+    elif button_id == "add_more":
         _send_main_menu(config, from_phone)
 
-    # 4. Sélection d'un article depuis le List Message
+    # 5. Sélection d'un article depuis le List Message
     elif interactive_type == "list_reply" and button_id:
         _handle_cart_item(snack_id, from_phone, button_id, message_text, config)
 
@@ -779,8 +758,17 @@ def _handle_cart_item(
                         price = None
                     break
 
-    items = _cart_add(from_phone, snack_id, item_id, item_title, price)
-    summary = _cart_summary(items)
+    # Récupérer le panier existant depuis Supabase, puis ajouter/incrémenter l'article
+    items = cart_get(from_phone, snack_id)
+    existing = next((it for it in items if it["id"] == item_id), None)
+    if existing:
+        existing["qty"] += 1
+    else:
+        items.append({"id": item_id, "name": item_title, "price": price, "qty": 1})
+    total_price = sum((it.get("price") or 0) * it["qty"] for it in items)
+    cart_upsert(from_phone, snack_id, items, total_price)
+
+    summary     = _cart_summary_from_items(items)
     total_items = sum(it["qty"] for it in items)
 
     try:
@@ -795,8 +783,8 @@ def _handle_cart_item(
             ),
             footer_text="SnackFlow • Commande rapide",
             buttons=[
-                {"id": "ADD_MORE",      "title": "➕ Ajouter"},
-                {"id": "VALIDATE_CART", "title": "✅ Valider"},
+                {"id": "add_more",  "title": "➕ Ajouter"},
+                {"id": "view_cart", "title": "🛒 Voir panier"},
             ],
         )
         print(f"✅ [CART] Article ajouté | item={item_id} | phone={_redact(from_phone)} | total={total_items}")
@@ -804,112 +792,51 @@ def _handle_cart_item(
         print(f"⚠️  [CART] Erreur envoi confirmation panier : {e}")
 
 
-def _handle_cart_validate(
-    snack_id: str,
-    from_phone: str,
-    config: dict,
-) -> None:
-    """
-    Finalise la commande depuis le panier client :
-      1. Récupère les items du panier
-      2. Crée la commande dans Supabase (status=pending)
-      3. Envoie confirmation au client
-      4. Envoie boutons validation au gérant
-      5. Vide le panier
-    """
-    items = _cart_get(from_phone)
-
+def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
+    """Affiche le récapitulatif du panier avec les boutons Ajouter / Valider."""
+    items = cart_get(from_phone, snack_id)
     if not items:
+        send_text_message(config, from_phone, "ℹ️ Votre panier est vide.")
+        _send_main_menu(config, from_phone)
+        return
+    summary   = _cart_summary_from_items(items)
+    total     = sum((it.get("price") or 0) * it["qty"] for it in items)
+    total_str = f"\n\n💰 *Total estimé : {total:.2f}€*" if total > 0 else ""
+    try:
+        send_interactive_buttons(
+            config=config,
+            recipient_phone=from_phone,
+            header_text="🛒 Votre panier",
+            body_text=f"*Récapitulatif :*\n{summary}{total_str}\n\nPrêt à valider ?",
+            footer_text="SnackFlow • Commande rapide",
+            buttons=[
+                {"id": "add_more",       "title": "➕ Ajouter"},
+                {"id": "validate_order", "title": "✅ Valider"},
+            ],
+        )
+        print(f"✅ [CART] Vue panier → {_redact(from_phone)} | {len(items)} article(s)")
+    except Exception as e:
+        print(f"⚠️  [CART] Erreur vue panier : {e}")
+
+
+def _handle_cart_validate(snack_id: str, from_phone: str, config: dict) -> None:
+    """
+    Délègue la finalisation complète à finalize_cart_order() (hubrise_tool).
+    Cette fonction orchestre : Supabase order, HubRise push, WA client, Telegram gérant, cart clear.
+    """
+    result = finalize_cart_order(phone=from_phone, config=config)
+    if result.get("status") == "error":
+        print(f"⚠️  [CART] finalize_cart_order error : {result.get('message')}")
         send_text_message(
             config, from_phone,
             "ℹ️ Votre panier est vide. Utilisez le menu pour sélectionner vos articles.",
         )
         _send_main_menu(config, from_phone)
-        return
-
-    nom_resto = config.get("nom_resto") or config.get("name", "Le Snack")
-
-    # Conversion vers le format legacy Supabase
-    parsed_items = [
-        {"name": it["name"], "qty": it["qty"], "price": it.get("price")}
-        for it in items
-    ]
-
-    # Création commande Supabase
-    order_id: Optional[str] = None
-    try:
-        order_result = create_order(
-            snack_id=snack_id,
-            data={
-                "customer_phone": from_phone,
-                "items":          parsed_items,
-                "status":         "pending",
-            },
+    else:
+        print(
+            f"✅ [CART] Commande finalisée | order={result.get('order_id', '?')[:8]} "
+            f"| hubrise={'ok' if result.get('hubrise_ok') else 'skipped'}"
         )
-        order_id = order_result.get("row", {}).get("id")
-        print(f"✅ [CART] Commande créée (id={order_id})")
-    except Exception as e:
-        print(f"⚠️  [CART] create_order échoué : {e}")
-
-    summary = _cart_summary(items)
-
-    # ── Push HubRise immédiat ──────────────────────────────────────────────────
-    hubrise_ok       = False
-    hubrise_order_id = ""
-    if order_id:
-        hr_token    = str(config.get("hubrise_access_token", "") or "").strip()
-        hr_location = str(config.get("hubrise_location_id", "") or "").strip()
-        try:
-            full_order = {
-                "id":             order_id,
-                "customer_phone": from_phone,
-                "items":          parsed_items,
-                "status":         "pending",
-            }
-            hr_result = push_to_hubrise(
-                order=full_order,
-                access_token=hr_token,
-                location_id=hr_location,
-                snack_name=nom_resto,
-            )
-            if hr_result.get("status") == "created":
-                hubrise_order_id = hr_result.get("hubrise_order_id", "")
-                link_hubrise_order(order_id, hubrise_order_id)
-                update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
-                hubrise_ok = True
-                print(f"✅ [CART] HubRise push OK | hr_id={hubrise_order_id}")
-            else:
-                print(f"⚠️  [CART] HubRise push non créé : {hr_result}")
-        except Exception as e:
-            print(f"⚠️  [CART] push_to_hubrise échoué (non bloquant) : {e}")
-
-    # ── Confirmation client ───────────────────────────────────────────────────
-    hubrise_line = "\n🟢 *Commande transmise en cuisine.*" if hubrise_ok else ""
-    try:
-        send_text_message(
-            config, from_phone,
-            f"🧾 *Récapitulatif :*\n\n{summary}{hubrise_line}\n\n"
-            f"✅ Merci chez _{nom_resto}_ 🙏",
-        )
-    except Exception as e:
-        print(f"⚠️  [CART] Erreur message confirmation client : {e}")
-
-    # ── Notification gérant (texte simple — push HubRise déjà effectué) ──────
-    resto_phone = str(config.get("resto_phone", "")).strip()
-    if resto_phone:
-        try:
-            hr_info = f"\n🟢 HubRise : {hubrise_order_id[:8]}…" if hubrise_ok else "\n⚠️ HubRise non transmis"
-            send_text_message(
-                config, resto_phone,
-                f"🆕 *Nouvelle commande*\nClient : {from_phone}\n\n{summary}{hr_info}",
-            )
-            print(f"✅ [CART] Notification gérant → {_redact(resto_phone)}")
-        except Exception as e:
-            print(f"⚠️  [CART] Notification gérant échouée : {e}")
-
-    # ── Vide le panier ────────────────────────────────────────────────────────
-    _cart_clear(from_phone)
-    print(f"✅ [CART] Panier vidé | phone={_redact(from_phone)}")
 
 
 def _process_new_order(

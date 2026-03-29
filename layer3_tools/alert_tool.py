@@ -128,6 +128,28 @@ def send_alert_async(
     t.start()
 
 
+def notify_telegram(message: str) -> None:
+    """
+    Envoie un message Telegram simple au canal configuré (non-bloquant).
+    Utilisé pour les notifications métier : nouvelle commande, push HubRise, etc.
+
+    Contrairement à send_alert(), n'ajoute pas de formatage HTML alerte — envoie
+    le texte brut tel quel. Non-bloquant (thread daemon).
+
+    :param message: Texte du message (Markdown HTML supporté par Telegram).
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("⚠️  notify_telegram : TELEGRAM_BOT_TOKEN/CHAT_ID manquants — message ignoré.")
+        return
+    t = threading.Thread(
+        target=_send_telegram_message,
+        args=(message,),
+        daemon=True,
+        name="telegram_notify",
+    )
+    t.start()
+
+
 # =============================================================================
 # HELPERS INTERNES
 # =============================================================================

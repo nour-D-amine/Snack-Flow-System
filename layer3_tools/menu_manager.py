@@ -2,12 +2,11 @@
 Layer 3 — Tools : Menu Manager (SnackFlow v3.1)
 ================================================
 Module dédié à la construction et l'envoi du menu interactif WhatsApp.
-Extrait de whatsapp_webhook.py pour rendre la logique menu réutilisable
-et testable indépendamment du webhook.
 
 Fonctions publiques :
-  - build_menu_sections(menu_data) → list   Construit les sections List Message
-  - send_main_menu(config, phone)  → None   Envoie le menu interactif au client
+  - build_menu_sections(menu_data) → list    Construit les sections List Message
+  - send_interactive_menu(config, phone)     Envoie le menu interactif au client
+  - send_main_menu                           Alias backward-compat
 """
 
 from __future__ import annotations
@@ -78,10 +77,11 @@ def build_menu_sections(menu_data) -> list:
     return sections
 
 
-def send_main_menu(config: dict, phone: str) -> None:
+def send_interactive_menu(config: dict, phone: str) -> None:
     """
     Envoie le menu interactif WhatsApp (List Message) au client.
     Construit dynamiquement depuis menu_data Supabase.
+    Utilise logo_url du snack comme header image si disponible.
     Fallback texte si menu_data absent ou vide.
 
     :param config: Dict issu de supabase_tool.get_snack_config().
@@ -94,7 +94,7 @@ def send_main_menu(config: dict, phone: str) -> None:
     sections  = build_menu_sections(menu_data)
 
     if not sections:
-        logger.info("send_main_menu : menu_data vide pour '%s' → fallback texte", nom_resto)
+        logger.info("send_interactive_menu : menu_data vide pour '%s' → fallback texte", nom_resto)
         send_text_message(
             config, phone,
             f"👋 Bienvenue chez *{nom_resto}* !\n\n"
@@ -103,11 +103,14 @@ def send_main_menu(config: dict, phone: str) -> None:
         )
         return
 
+    logo_url = str(config.get("logo_url", "") or "").strip()
+
     send_list_menu(
         config=config,
         customer_phone=phone,
         sections=sections,
-        header_text=f"🍔 {nom_resto}"[:60],
+        logo_url=logo_url,
+        header_text="" if logo_url else f"🍔 {nom_resto}"[:60],
         body_text=(
             "Bonjour ! 👋 Bienvenue chez *" + nom_resto + "*.\n"
             "Sélectionnez un article pour l'ajouter à votre panier."
@@ -115,4 +118,8 @@ def send_main_menu(config: dict, phone: str) -> None:
         button_text="Voir le menu",
         footer_text="SnackFlow • Commande rapide",
     )
-    logger.info("send_main_menu → List Message envoyé à %s (%d sections)", phone, len(sections))
+    logger.info("send_interactive_menu → List Message envoyé à %s (%d sections)", phone, len(sections))
+
+
+# Alias backward-compat — l'ancien nom est conservé pour ne pas casser les imports existants
+send_main_menu = send_interactive_menu
