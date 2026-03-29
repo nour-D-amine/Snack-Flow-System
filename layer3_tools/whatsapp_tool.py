@@ -341,7 +341,91 @@ def send_interactive_buttons(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. TICKET CUISINE — NOTIFICATION RESTAURATEUR
+# 5. LIST MESSAGE — MENU INTERACTIF (sélection produit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def send_list_menu(
+    config: dict,
+    customer_phone: str,
+    sections: list,
+    body_text: str = "Choisissez un article :",
+    button_text: str = "Voir le menu",
+    header_text: str = "",
+    footer_text: str = "",
+) -> dict:
+    """
+    Envoie un message interactif de type 'list' (menu déroulant WhatsApp).
+
+    Contraintes Meta :
+      - button_text  : max 20 caractères
+      - header_text  : max 60 caractères
+      - sections[].title    : max 24 caractères
+      - rows[].id           : max 200 caractères
+      - rows[].title        : max 24 caractères
+      - rows[].description  : max 72 caractères
+      - Max 10 lignes au total toutes sections confondues
+
+    :param config:          Dict issu de supabase_tool.get_snack_config().
+    :param customer_phone:  Destinataire au format E.164.
+    :param sections:        Liste de sections [{"title": "...", "rows": [{"id": "...", "title": "...", "description": "..."}]}].
+    :param body_text:       Corps du message (obligatoire).
+    :param button_text:     Libellé du bouton d'ouverture (max 20 chars).
+    :param header_text:     En-tête optionnel (max 60 chars).
+    :param footer_text:     Pied de message optionnel (max 60 chars).
+    :return:                Réponse JSON de Meta ou dict d'erreur.
+    """
+    phone_id, token = _resolve_credentials(config)
+
+    if not sections:
+        logger.error("send_list_menu : sections vides — envoi annulé.")
+        return {"error": "empty_sections"}
+
+    # Respect des limites Meta
+    safe_sections = []
+    total_rows = 0
+    for section in sections:
+        rows = []
+        for row in section.get("rows", []):
+            if total_rows >= 10:
+                break
+            rows.append({
+                "id":          str(row.get("id", ""))[:200],
+                "title":       str(row.get("title", ""))[:24],
+                "description": str(row.get("description", ""))[:72],
+            })
+            total_rows += 1
+        if rows:
+            safe_sections.append({
+                "title": str(section.get("title", "Menu"))[:24],
+                "rows":  rows,
+            })
+
+    interactive: dict = {
+        "type": "list",
+        "body": {"text": body_text[:1024]},
+        "action": {
+            "button":   button_text[:20],
+            "sections": safe_sections,
+        },
+    }
+    if header_text:
+        interactive["header"] = {"type": "text", "text": header_text[:60]}
+    if footer_text:
+        interactive["footer"] = {"text": footer_text[:60]}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type":    "individual",
+        "to":                customer_phone,
+        "type":              "interactive",
+        "interactive":       interactive,
+    }
+
+    return _post(_build_endpoint(phone_id), token, payload)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. TICKET CUISINE — NOTIFICATION RESTAURATEUR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def send_kitchen_ticket(config: dict, order_data: dict) -> dict:

@@ -29,6 +29,13 @@ Schémas HubRise v1 (source : developers.hubrise.com) :
   - options    → [{name: str, price: str}] (modifiers/toppings)
 """
 
+# =============================================================================
+# ⛔  MODULE DÉSACTIVÉ — gemini_tool.py (SnackFlow v3.1)
+# Ce module n'est plus importé par le webhook.
+# Le flux de commande est désormais 100% déterministe via List Messages WhatsApp.
+# Conservé pour référence et réactivation future (upsell IA, parsing texte libre).
+# =============================================================================
+
 from __future__ import annotations
 
 import json
@@ -54,7 +61,10 @@ logger.setLevel(logging.INFO)
 # ─── Config ────────────────────────────────────────────────────────────────────
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+print(f"DEBUG: GEMINI_API_KEY loaded = {'YES' if GEMINI_API_KEY else 'NO'}", flush=True)
+print(f"DEBUG: GEMINI_MODEL = {GEMINI_MODEL}", flush=True)
 
 
 # =============================================================================
@@ -275,7 +285,9 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
     text = user_text.strip()
 
     try:
+        print(f"🔵 [GEMINI] _get_genai() called...", flush=True)
         genai = _get_genai()
+        print(f"🔵 [GEMINI] _get_genai() returned OK", flush=True)
 
         # Construction dynamique du System Prompt
         sys_prompt = _ORDER_PARSER_SYSTEM
@@ -291,18 +303,21 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
                 "Informe le client dans customer_notes si son article est indisponible."
             )
 
-        # Structured Output : Gemini retourne directement un JSON conforme au schéma
+        print(f"DEBUG: Envoi de la requête à Gemini... (model={GEMINI_MODEL})", flush=True)
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
             system_instruction=sys_prompt,
         )
 
+        print(f"DEBUG: Calling model.generate_content...", flush=True)
         response = model.generate_content(
             text,
             generation_config={
                 **_ORDER_PARSER_GENERATION_CONFIG,
             },
+            request_options={"timeout": 30},
         )
+        print(f"DEBUG: model.generate_content returned OK", flush=True)
 
         raw_json = response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```').strip()
         order_data = json.loads(raw_json)
@@ -315,8 +330,10 @@ def parse_order_skill(user_text: str, menu_context: dict = None) -> HubRiseOrder
         return order
 
     except RuntimeError as e:
+        print(f"DEBUG ERROR: RuntimeError: {e}", flush=True)
         logger.warning("⚠️  Gemini indisponible (%s) → fallback texte brut", e)
     except Exception as e:
+        print(f"DEBUG ERROR: {type(e).__name__}: {e}", flush=True)
         logger.warning("⚠️  parse_order_skill erreur (%s: %s) → fallback texte brut", type(e).__name__, e)
 
     return _fallback_order(text)
@@ -428,6 +445,7 @@ def generate_upsell_skill(order_data: HubRiseOrder, menu_context: dict = None) -
             generation_config={
                 **_UPSELL_GENERATION_CONFIG,
             },
+            request_options={"timeout": 30},
         )
 
         raw_json = response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```').strip()

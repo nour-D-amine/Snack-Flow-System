@@ -48,7 +48,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from layer3_tools.phone_tool import safe_normalize
 from layer3_tools.whatsapp_tool import (
-    send_interactive_menu,
     send_interactive_buttons,
     send_text_message,
 )
@@ -64,8 +63,8 @@ from layer3_tools.supabase_tool import (
     link_hubrise_order,
     health_check as supabase_health,
 )
-from layer3_tools.gemini_tool import parse_order_skill, generate_upsell_skill
 from layer3_tools.hubrise_tool import push_to_hubrise, sync_stock_with_supabase
+from layer3_tools.menu_manager import build_menu_sections, send_main_menu as _send_main_menu
 from layer3_tools.alert_tool import send_alert_async, format_exception_alert
 from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
 
@@ -281,6 +280,74 @@ def _handle_deletion_request(config: dict, snack_id: str, customer_phone: str) -
 
 
 # =============================================================================
+# PANIER CLIENT — État en mémoire (thread-safe)
+# Note Railway : fonctionne en mode single-worker (1 Gunicorn worker).
+#   Si vous passez à plusieurs workers, migrez vers une table Supabase `carts`.
+# =============================================================================
+
+_CARTS: dict      = {}   # {phone_e164: {"items": [...], "snack_id": str}}
+_CARTS_LOCK       = threading.Lock()
+
+# Format d'un item panier :
+#   {"id": str, "name": str, "price": float|None, "qty": int}
+
+def _cart_add(phone: str, snack_id: str, item_id: str, item_name: str, price: float = None) -> list:
+    """Ajoute ou incrémente un article dans le panier. Retourne la liste d'items."""
+    with _CARTS_LOCK:
+        cart = _CARTS.setdefault(phone, {"items": [], "snack_id": snack_id})
+        for existing in cart["items"]:
+            if existing["id"] == item_id:
+                existing["qty"] += 1
+                return list(cart["items"])
+        cart["items"].append({"id": item_id, "name": item_name, "price": price, "qty": 1})
+        return list(cart["items"])
+
+
+def _cart_get(phone: str) -> list:
+    with _CARTS_LOCK:
+        return list(_CARTS.get(phone, {}).get("items", []))
+
+
+def _cart_clear(phone: str) -> None:
+    with _CARTS_LOCK:
+        _CARTS.pop(phone, None)
+
+
+def _cart_summary(items: list) -> str:
+    """Retourne une chaîne récapitulative du panier."""
+    lines = [f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
+             for it in items]
+    return "\n".join(lines)
+
+
+# =============================================================================
+# MOTS DE SALUTATION — Déclencheurs du menu interactif
+# =============================================================================
+
+_GREETING_KEYWORDS = frozenset([
+    "bonjour", "bonsoir", "salut", "hello", "hi", "hey",
+    "menu", "carte", "commander", "commande", "bon", "yo",
+    "start", "debut", "début", "je veux commander", "je voudrais",
+])
+
+
+def _is_greeting(text: str) -> bool:
+    """Détecte si le message est une salutation ou une demande de menu."""
+    normalized = _normalize_for_match(text).strip()
+    # Correspondance exacte ou début de message
+    if normalized in _GREETING_KEYWORDS:
+        return True
+    for kw in _GREETING_KEYWORDS:
+        if normalized.startswith(kw):
+            return True
+    return False
+
+
+# =============================================================================
+# MENU INTERACTIF — Constructeur dynamique depuis menu_data Supabase
+# =============================================================================
+
+# =============================================================================
 # PARSING DU PAYLOAD META WHATSAPP (format réel Cloud API)
 # =============================================================================
 
@@ -337,18 +404,22 @@ def _parse_whatsapp_payload(data: dict) -> Optional[dict]:
         message_type = msg.get("type", "text")       # "text" | "interactive" | "image"...
         message_text = ""
 
-        button_id = ""
+        button_id        = ""
+        interactive_type = ""
         if message_type == "text":
             message_text = msg.get("text", {}).get("body", "").strip()
         elif message_type == "interactive":
             # Bouton reply ou list reply
-            interactive = msg.get("interactive", {})
-            if interactive.get("type") == "button_reply":
+            interactive      = msg.get("interactive", {})
+            interactive_type = interactive.get("type", "")
+            if interactive_type == "button_reply":
                 button_reply = interactive.get("button_reply", {})
                 message_text = button_reply.get("title", "")
                 button_id    = button_reply.get("id", "")
-            elif interactive.get("type") == "list_reply":
-                message_text = interactive.get("list_reply", {}).get("title", "")
+            elif interactive_type == "list_reply":
+                list_reply   = interactive.get("list_reply", {})
+                message_text = list_reply.get("title", "")
+                button_id    = list_reply.get("id", "")   # ID produit sélectionné
         else:
             # Type non géré (image, audio, etc.) — on log mais on ne crash pas
             message_text = f"[{message_type}]"
@@ -361,11 +432,12 @@ def _parse_whatsapp_payload(data: dict) -> Optional[dict]:
             from_phone = "+" + from_phone
 
         return {
-            "from_phone":      safe_normalize(from_phone) or from_phone,
-            "message_text":    _sanitize(message_text, max_len=1024),
-            "message_type":    message_type,
-            "phone_number_id": phone_number_id,
-            "button_id":       button_id,
+            "from_phone":       safe_normalize(from_phone) or from_phone,
+            "message_text":     _sanitize(message_text, max_len=1024),
+            "message_type":     message_type,
+            "phone_number_id":  phone_number_id,
+            "button_id":        button_id,
+            "interactive_type": interactive_type,
         }
 
     except Exception as e:
@@ -489,11 +561,12 @@ def whatsapp_webhook():
         # Peut être un événement "read receipt" ou "status" — on accepte silencieusement
         return jsonify({"status": "ignored"}), 200
 
-    from_phone      = parsed["from_phone"]
-    message_text    = parsed["message_text"]
-    message_type    = parsed["message_type"]
-    phone_number_id = parsed.get("phone_number_id", "")
-    button_id       = parsed.get("button_id", "")
+    from_phone       = parsed["from_phone"]
+    message_text     = parsed["message_text"]
+    message_type     = parsed["message_type"]
+    phone_number_id  = parsed.get("phone_number_id", "")
+    button_id        = parsed.get("button_id", "")
+    interactive_type = parsed.get("interactive_type", "")
 
     # ── Authentification Multi-Tenant ────────────────────────────────────────
     # Chaque requête Meta porte metadata.phone_number_id.
@@ -530,7 +603,7 @@ def whatsapp_webhook():
     )
 
     # Traitement asynchrone — réponse 202 immédiate à Meta
-    _executor.submit(_process_message, snack_id, from_phone, message_text, message_type, button_id)
+    _executor.submit(_process_message, snack_id, from_phone, message_text, message_type, button_id, interactive_type)
 
     return jsonify({"status": "accepted"}), 202
 
@@ -545,28 +618,48 @@ def _process_message(
     message_text: str,
     message_type: str,
     button_id: str = "",
+    interactive_type: str = "",
 ):
     """
     Point d'entrée du traitement asynchrone.
     Route vers :
-      - _handle_manager_callback() si le message vient du gérant et porte un button_id de validation
-      - _process_new_order() pour toute autre commande client
+      - _handle_manager_callback()  si gérant + button_id CONFIRM/REJECT/CALL
+      - _handle_cart_validate()     si button_id == "VALIDATE_CART"
+      - _send_main_menu()           si button_id == "ADD_MORE"
+      - _handle_cart_item()         si interactive_type == "list_reply"
+      - _process_new_order()        pour tous les autres messages texte
     """
     config = _load_config(snack_id)
     if not config:
         print(f"❌ [PROCESS] Config snack '{snack_id}' introuvable — abandon.")
         return
 
-    resto_phone = str(config.get("resto_phone", "")).strip()
+    resto_phone       = str(config.get("resto_phone", "")).strip()
     _MANAGER_PREFIXES = ("CONFIRM_", "REJECT_", "CALL_")
 
+    # 1. Callbacks gérant (CONFIRM / REJECT / CALL)
     if (
         button_id
+        and interactive_type == "button_reply"
         and resto_phone
         and from_phone == resto_phone
         and any(button_id.startswith(p) for p in _MANAGER_PREFIXES)
     ):
         _handle_manager_callback(button_id, from_phone, config, snack_id)
+
+    # 2. Validation du panier client
+    elif button_id == "VALIDATE_CART":
+        _handle_cart_validate(snack_id, from_phone, config)
+
+    # 3. Le client veut ajouter un autre article
+    elif button_id == "ADD_MORE":
+        _send_main_menu(config, from_phone)
+
+    # 4. Sélection d'un article depuis le List Message
+    elif interactive_type == "list_reply" and button_id:
+        _handle_cart_item(snack_id, from_phone, button_id, message_text, config)
+
+    # 5. Message texte (salutation, commande libre, RGPD…)
     else:
         _process_new_order(snack_id, from_phone, message_text, message_type, config)
 
@@ -659,6 +752,166 @@ def _handle_manager_callback(
         print(f"⚠️  [CALLBACK] Action inconnue : '{action}'")
 
 
+def _handle_cart_item(
+    snack_id: str,
+    from_phone: str,
+    item_id: str,
+    item_title: str,
+    config: dict,
+) -> None:
+    """
+    Ajoute l'article sélectionné dans le panier client et envoie une confirmation
+    avec deux boutons : continuer les achats ou valider la commande.
+    """
+    # Récupère le prix depuis menu_data si disponible
+    price = None
+    menu_data = config.get("menu_data")
+    if menu_data:
+        sections = build_menu_sections(menu_data)
+        for section in sections:
+            for row in section.get("rows", []):
+                if row["id"] == item_id:
+                    # Le prix est encodé dans la description ("8.50€")
+                    desc = row.get("description", "")
+                    try:
+                        price = float(desc.replace("€", "").strip())
+                    except ValueError:
+                        price = None
+                    break
+
+    items = _cart_add(from_phone, snack_id, item_id, item_title, price)
+    summary = _cart_summary(items)
+    total_items = sum(it["qty"] for it in items)
+
+    try:
+        send_interactive_buttons(
+            config=config,
+            recipient_phone=from_phone,
+            header_text=f"🛒 Panier ({total_items} article{'s' if total_items > 1 else ''})",
+            body_text=(
+                f"✅ *{item_title}* ajouté !\n\n"
+                f"*Votre panier :*\n{summary}\n\n"
+                "Que souhaitez-vous faire ?"
+            ),
+            footer_text="SnackFlow • Commande rapide",
+            buttons=[
+                {"id": "ADD_MORE",      "title": "➕ Ajouter"},
+                {"id": "VALIDATE_CART", "title": "✅ Valider"},
+            ],
+        )
+        print(f"✅ [CART] Article ajouté | item={item_id} | phone={_redact(from_phone)} | total={total_items}")
+    except Exception as e:
+        print(f"⚠️  [CART] Erreur envoi confirmation panier : {e}")
+
+
+def _handle_cart_validate(
+    snack_id: str,
+    from_phone: str,
+    config: dict,
+) -> None:
+    """
+    Finalise la commande depuis le panier client :
+      1. Récupère les items du panier
+      2. Crée la commande dans Supabase (status=pending)
+      3. Envoie confirmation au client
+      4. Envoie boutons validation au gérant
+      5. Vide le panier
+    """
+    items = _cart_get(from_phone)
+
+    if not items:
+        send_text_message(
+            config, from_phone,
+            "ℹ️ Votre panier est vide. Utilisez le menu pour sélectionner vos articles.",
+        )
+        _send_main_menu(config, from_phone)
+        return
+
+    nom_resto = config.get("nom_resto") or config.get("name", "Le Snack")
+
+    # Conversion vers le format legacy Supabase
+    parsed_items = [
+        {"name": it["name"], "qty": it["qty"], "price": it.get("price")}
+        for it in items
+    ]
+
+    # Création commande Supabase
+    order_id: Optional[str] = None
+    try:
+        order_result = create_order(
+            snack_id=snack_id,
+            data={
+                "customer_phone": from_phone,
+                "items":          parsed_items,
+                "status":         "pending",
+            },
+        )
+        order_id = order_result.get("row", {}).get("id")
+        print(f"✅ [CART] Commande créée (id={order_id})")
+    except Exception as e:
+        print(f"⚠️  [CART] create_order échoué : {e}")
+
+    summary = _cart_summary(items)
+
+    # ── Push HubRise immédiat ──────────────────────────────────────────────────
+    hubrise_ok       = False
+    hubrise_order_id = ""
+    if order_id:
+        hr_token    = str(config.get("hubrise_access_token", "") or "").strip()
+        hr_location = str(config.get("hubrise_location_id", "") or "").strip()
+        try:
+            full_order = {
+                "id":             order_id,
+                "customer_phone": from_phone,
+                "items":          parsed_items,
+                "status":         "pending",
+            }
+            hr_result = push_to_hubrise(
+                order=full_order,
+                access_token=hr_token,
+                location_id=hr_location,
+                snack_name=nom_resto,
+            )
+            if hr_result.get("status") == "created":
+                hubrise_order_id = hr_result.get("hubrise_order_id", "")
+                link_hubrise_order(order_id, hubrise_order_id)
+                update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
+                hubrise_ok = True
+                print(f"✅ [CART] HubRise push OK | hr_id={hubrise_order_id}")
+            else:
+                print(f"⚠️  [CART] HubRise push non créé : {hr_result}")
+        except Exception as e:
+            print(f"⚠️  [CART] push_to_hubrise échoué (non bloquant) : {e}")
+
+    # ── Confirmation client ───────────────────────────────────────────────────
+    hubrise_line = "\n🟢 *Commande transmise en cuisine.*" if hubrise_ok else ""
+    try:
+        send_text_message(
+            config, from_phone,
+            f"🧾 *Récapitulatif :*\n\n{summary}{hubrise_line}\n\n"
+            f"✅ Merci chez _{nom_resto}_ 🙏",
+        )
+    except Exception as e:
+        print(f"⚠️  [CART] Erreur message confirmation client : {e}")
+
+    # ── Notification gérant (texte simple — push HubRise déjà effectué) ──────
+    resto_phone = str(config.get("resto_phone", "")).strip()
+    if resto_phone:
+        try:
+            hr_info = f"\n🟢 HubRise : {hubrise_order_id[:8]}…" if hubrise_ok else "\n⚠️ HubRise non transmis"
+            send_text_message(
+                config, resto_phone,
+                f"🆕 *Nouvelle commande*\nClient : {from_phone}\n\n{summary}{hr_info}",
+            )
+            print(f"✅ [CART] Notification gérant → {_redact(resto_phone)}")
+        except Exception as e:
+            print(f"⚠️  [CART] Notification gérant échouée : {e}")
+
+    # ── Vide le panier ────────────────────────────────────────────────────────
+    _cart_clear(from_phone)
+    print(f"✅ [CART] Panier vidé | phone={_redact(from_phone)}")
+
+
 def _process_new_order(
     snack_id: str,
     from_phone: str,
@@ -701,130 +954,28 @@ def _process_new_order(
         except Exception as e:
             print(f"⚠️  [ORDER] Notice RGPD échouée (non bloquant) : {e}")
 
-    # ── Étape 2a : SKILL 1 — OrderParser (texte → HubRiseOrder) ─────────────
-    from layer3_tools.gemini_tool import HubRiseOrder  # import local pour éviter cycle
-    order_data: HubRiseOrder = HubRiseOrder(items=[])  # défaut sécurisé
-    
-    # Catalogue produit pour les Skills
-    menu_data = config.get("menu_data")
-
-    if message_type == "text" and message_text:
+    # ── Étape 2 : Routage principal ──────────────────────────────────────────
+    # Salutation ou demande de menu → envoie le List Message interactif
+    if message_type == "text" and _is_greeting(message_text):
+        print(f"👋 [ORDER] Salutation détectée → envoi menu interactif")
         try:
-            order_data = parse_order_skill(message_text, menu_context=menu_data)
-            print(
-                f"✅ [SKILL1] OrderParser → {len(order_data.items)} article(s) "
-                f"| {[it.product_name for it in order_data.items]}"
-            )
+            _send_main_menu(config, from_phone)
         except Exception as e:
-            print(f"⚠️  [SKILL1] parse_order_skill échoué (non bloquant) : {e}")
+            print(f"⚠️  [ORDER] send_main_menu échoué : {e}")
+        elapsed = round(time.time() - start_time, 2)
+        print(f"✅ [ORDER] Menu envoyé en {elapsed}s\n")
+        return
 
-    # ── Étape 2b : SKILL 2 — LogicalUpseller (panier → suggestion AOV) ──────
-    upsell = None
+    # Message texte non reconnu → invite à utiliser le menu
+    print(f"ℹ️  [ORDER] Message non structuré → redirection vers menu")
     try:
-        upsell = generate_upsell_skill(order_data, menu_context=menu_data)
-        if upsell:
-            print(
-                f"✅ [SKILL2] Upsell → '{upsell.suggested_item}' | "
-                f"raison='{upsell.reason}'"
-            )
-        else:
-            print("ℹ️  [SKILL2] Aucune suggestion upsell (panier vide ou LLM indisponible)")
-    except Exception as e:
-        print(f"⚠️  [SKILL2] generate_upsell_skill échoué (non bloquant) : {e}")
-
-    # Conversion vers format legacy pour Supabase + hubrise_tool
-    parsed_items = order_data.to_legacy_items() if not order_data.is_empty() else [
-        {"name": message_text or f"[{message_type}]", "qty": 1, "price": None}
-    ]
-
-    # ── Étape 3 : Création commande Supabase (status=pending) ────────────────
-    order_id: Optional[str] = None
-    try:
-        order_result = create_order(
-            snack_id=snack_id,
-            data={
-                "customer_phone": from_phone,
-                "items":          parsed_items,
-                "status":         "pending",
-            },
+        send_text_message(
+            config, from_phone,
+            "👇 Utilisez notre menu pour passer votre commande facilement :",
         )
-        order_id = order_result.get("row", {}).get("id")
-        print(f"✅ [ORDER] Commande créée (id={order_id})")
+        _send_main_menu(config, from_phone)
     except Exception as e:
-        print(f"⚠️  [ORDER] create_order échoué : {e}")
-
-    # ── Étape 4 : Message combiné WhatsApp → Client ───────────────────────────
-    # Récapitulatif des articles
-    if parsed_items and parsed_items[0].get("name") != message_text:
-        recap_lines = "\n".join(
-            f"  • {it.get('qty', 1)}x {it.get('name', '?')}"
-            for it in parsed_items
-        )
-        recap_block = f"🧾 *Récapitulatif de votre commande :*\n\n{recap_lines}"
-    else:
-        recap_block = f"📝 *Commande reçue :*\n  {message_text[:200]}"
-
-    # Bloc upsell (uniquement si suggestion disponible)
-    upsell_block = ""
-    if upsell and upsell.whatsapp_message:
-        upsell_block = f"\n\n➕ *Et pourquoi pas...* \n{upsell.whatsapp_message}"
-
-    # Note client globale
-    global_note = ""
-    if order_data.customer_notes:
-        global_note = f"\n\n📌 Note : {order_data.customer_notes}"
-
-    client_message = (
-        f"{recap_block}"
-        f"{upsell_block}"
-        f"{global_note}"
-        f"\n\n✅ Nous vous confirmons votre commande dans quelques instants !"
-    )
-
-    try:
-        wa_result = send_text_message(config, from_phone, client_message)
-        if "error" not in wa_result:
-            has_upsell = "✅" if upsell else "—"
-            print(f"✅ [ORDER] Message combiné (recap+upsell={has_upsell}) → {_redact(from_phone)}")
-        else:
-            print(f"❌ [ORDER] Échec envoi message client : {wa_result.get('error')}")
-            # Fallback : tente d'envoyer le menu interactif
-            try:
-                send_interactive_menu(config, from_phone)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"❌ [ORDER] Erreur envoi WA client : {e}")
-
-    # ── Étape 5 : Boutons de validation → Gérant ─────────────────────────────
-    resto_phone = str(config.get("resto_phone", "")).strip()
-    if order_id and resto_phone:
-        try:
-            items_txt = "\n".join(
-                f"  • {it.get('qty', 1)}x {it.get('name', '?')}"
-                for it in parsed_items
-            )
-            send_interactive_buttons(
-                config=config,
-                recipient_phone=resto_phone,
-                header_text="🆕 Nouvelle commande",
-                body_text=(
-                    f"Client : {from_phone}\n\n"
-                    f"{items_txt}\n\n"
-                    f"ID : {order_id[:8]}…"
-                ),
-                footer_text="SnackFlow • Validation requise",
-                buttons=[
-                    {"id": f"CONFIRM_{order_id}", "title": "✅ Valider"},
-                    {"id": f"REJECT_{order_id}",  "title": "❌ Refuser"},
-                    {"id": f"CALL_{order_id}",    "title": "📞 Appeler"},
-                ],
-            )
-            print(f"✅ [ORDER] Boutons validation envoyés → gérant ({_redact(resto_phone)})")
-        except Exception as e:
-            print(f"⚠️  [ORDER] Boutons validation échoués : {e}")
-    else:
-        print("⚠️  [ORDER] resto_phone absent — boutons validation non envoyés.")
+        print(f"⚠️  [ORDER] Redirection menu échouée : {e}")
 
     elapsed = round(time.time() - start_time, 2)
     print(f"✅ [ORDER] Terminé en {elapsed}s\n")

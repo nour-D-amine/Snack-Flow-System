@@ -127,9 +127,11 @@ def sop_start_webhook_server() -> bool:
     print(f"   Écoute : http://{SERVER_HOST}:{SERVER_PORT}")
 
     try:
+        _env = os.environ.copy()
+        _env["PYTHONUNBUFFERED"] = "1"
         _server_process = subprocess.Popen(
             [sys.executable, webhook_script],
-            env=os.environ.copy()
+            env=_env,
         )
         print(f"✅ Serveur WhatsApp Webhook démarré (PID: {_server_process.pid})")
         return True

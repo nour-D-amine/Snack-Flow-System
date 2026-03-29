@@ -22,8 +22,8 @@ def test_e2e():
                     {
                         "value": {
                             "metadata": {
-                                "phone_number_id": "33612345678",
-                                "display_phone_number": "33612345678"
+                                "phone_number_id": "15557586424",
+                                "display_phone_number": "15557586424"
                             },
                             "contacts": [
                                 {
@@ -39,7 +39,7 @@ def test_e2e():
                                     "id": "wamid.HBgLMzMzMzMzMzMzMzM=",
                                     "timestamp": "1609459200",
                                     "text": {
-                                        "body": "Bonjour ! Je voudrais un Menu Burger Classic avec un Coca et un Burger Classic seul sans oignons svp."
+                                        "body": "Je voudrais un Menu Burger Classic et un Tiramisu svp."
                                     },
                                     "type": "text"
                                 }
