@@ -124,12 +124,15 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
             logger.info("✅ Message envoyé → %s | message_id=%s", payload.get("to"), msg_id)
         else:
             error_detail = data.get("error", {})
+            error_msg = error_detail.get("message", "Erreur inconnue")
+            error_data = error_detail.get("error_data", {}).get("details", "")
             logger.error(
-                "❌ Échec API Meta → %s | HTTP %s | code=%s | msg=%s",
+                "❌ Échec API Meta → %s | HTTP %s | code=%s | msg=%s | details=%s",
                 payload.get("to"),
                 response.status_code,
                 error_detail.get("code"),
-                error_detail.get("message"),
+                error_msg,
+                error_data
             )
 
         return data

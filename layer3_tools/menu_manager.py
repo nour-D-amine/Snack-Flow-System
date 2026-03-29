@@ -105,7 +105,7 @@ def send_interactive_menu(config: dict, phone: str) -> None:
 
     logo_url = str(config.get("logo_url", "") or "").strip()
 
-    send_list_menu(
+    result = send_list_menu(
         config=config,
         customer_phone=phone,
         sections=sections,
@@ -118,7 +118,17 @@ def send_interactive_menu(config: dict, phone: str) -> None:
         button_text="Voir le menu",
         footer_text="SnackFlow • Commande rapide",
     )
-    logger.info("send_interactive_menu → List Message envoyé à %s (%d sections)", phone, len(sections))
+
+    if result and "error" in result:
+        logger.error("❌ Le menu interactif a été rejeté par Meta : %s. Passage au fallback texte.", result.get("error"))
+        fallback_msg = (
+            f"👋 Bienvenue chez *{nom_resto}* !\n\n"
+            "Nous rencontrons un problème pour afficher notre menu interactif.\n"
+            "Veuillez simplement écrire votre commande directement en message (ex: *1 burger classique avec frites*). 🙏"
+        )
+        send_text_message(config, phone, fallback_msg)
+    else:
+        logger.info("send_interactive_menu → List Message envoyé à %s (%d sections)", phone, len(sections))
 
 
 # Alias backward-compat — l'ancien nom est conservé pour ne pas casser les imports existants
