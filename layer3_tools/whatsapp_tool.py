@@ -147,6 +147,160 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SAFE-GATE — Validation et troncature des payloads Meta
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Limites Meta WhatsApp Cloud API (source : developers.facebook.com)
+_META_LIMITS = {
+    "button_title":       20,   # reply button title
+    "button_id":         256,   # reply button id
+    "row_id":            200,   # list row id
+    "row_title":          24,   # list row title
+    "row_description":    72,   # list row description
+    "section_title":      24,   # list section title
+    "header_text":        60,   # header text
+    "footer_text":        60,   # footer text
+    "body_text":        1024,   # body text (interactive)
+    "button_text":        20,   # list open-button label
+    "max_buttons":         3,   # max reply buttons
+    "max_total_rows":     10,   # max rows across all sections
+}
+
+
+def validate_meta_payload(payload: dict) -> dict:
+    """
+    Vérifie et tronque un payload interactif WhatsApp pour respecter
+    toutes les limites Meta. Retourne le payload corrigé (copie modifiée).
+
+    Limites appliquées :
+      - Titres de boutons    : max 20 chars
+      - IDs de boutons       : max 256 chars
+      - IDs de lignes (list) : max 200 chars
+      - Titres de lignes     : max 24 chars
+      - Descriptions lignes  : max 72 chars
+      - Titres de sections   : max 24 chars
+      - Header text          : max 60 chars
+      - Footer text          : max 60 chars
+      - Body text            : max 1024 chars
+      - Button text (list)   : max 20 chars
+      - Max 3 boutons reply
+      - Max 10 lignes au total dans un list message
+
+    Si un champ est tronqué, un warning est émis dans les logs.
+
+    :param payload: Dict du payload WhatsApp (clé 'interactive' attendue).
+    :return: Payload validé et tronqué (modifié in-place + retourné).
+    """
+    interactive = payload.get("interactive")
+    if not interactive:
+        return payload
+
+    msg_type = interactive.get("type", "")
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    header = interactive.get("header", {})
+    if header.get("type") == "text" and header.get("text"):
+        original = header["text"]
+        header["text"] = _safe_truncate(original, _META_LIMITS["header_text"], "header_text")
+
+    # ── Body ─────────────────────────────────────────────────────────────────
+    body = interactive.get("body", {})
+    if body.get("text"):
+        original = body["text"]
+        body["text"] = _safe_truncate(original, _META_LIMITS["body_text"], "body_text")
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    footer = interactive.get("footer", {})
+    if footer.get("text"):
+        original = footer["text"]
+        footer["text"] = _safe_truncate(original, _META_LIMITS["footer_text"], "footer_text")
+
+    # ── Boutons reply (type=button) ──────────────────────────────────────────
+    if msg_type == "button":
+        action = interactive.get("action", {})
+        buttons = action.get("buttons", [])
+
+        if len(buttons) > _META_LIMITS["max_buttons"]:
+            logger.warning(
+                "⚠️  [SAFE-GATE] Trop de boutons (%d) — tronqué à %d.",
+                len(buttons), _META_LIMITS["max_buttons"],
+            )
+            buttons = buttons[:_META_LIMITS["max_buttons"]]
+            action["buttons"] = buttons
+
+        for btn in buttons:
+            reply = btn.get("reply", {})
+            if reply.get("id"):
+                reply["id"] = _safe_truncate(
+                    str(reply["id"]), _META_LIMITS["button_id"], "button_id"
+                )
+            if reply.get("title"):
+                reply["title"] = _safe_truncate(
+                    str(reply["title"]), _META_LIMITS["button_title"], "button_title"
+                )
+
+    # ── List message (type=list) ─────────────────────────────────────────────
+    elif msg_type == "list":
+        action = interactive.get("action", {})
+
+        # Bouton d'ouverture de la liste
+        if action.get("button"):
+            action["button"] = _safe_truncate(
+                str(action["button"]), _META_LIMITS["button_text"], "button_text"
+            )
+
+        sections = action.get("sections", [])
+        total_rows = 0
+
+        for section in sections:
+            if section.get("title"):
+                section["title"] = _safe_truncate(
+                    str(section["title"]), _META_LIMITS["section_title"], "section_title"
+                )
+
+            safe_rows = []
+            for row in section.get("rows", []):
+                if total_rows >= _META_LIMITS["max_total_rows"]:
+                    logger.warning(
+                        "⚠️  [SAFE-GATE] Max %d lignes atteint — lignes restantes ignorées.",
+                        _META_LIMITS["max_total_rows"],
+                    )
+                    break
+
+                if row.get("id"):
+                    row["id"] = _safe_truncate(
+                        str(row["id"]), _META_LIMITS["row_id"], "row_id"
+                    )
+                if row.get("title"):
+                    row["title"] = _safe_truncate(
+                        str(row["title"]), _META_LIMITS["row_title"], "row_title"
+                    )
+                if row.get("description"):
+                    row["description"] = _safe_truncate(
+                        str(row["description"]), _META_LIMITS["row_description"], "row_description"
+                    )
+
+                safe_rows.append(row)
+                total_rows += 1
+
+            section["rows"] = safe_rows
+
+    return payload
+
+
+def _safe_truncate(value: str, max_len: int, field_name: str) -> str:
+    """Tronque si nécessaire et log un warning."""
+    if len(value) <= max_len:
+        return value
+    truncated = value[:max_len]
+    logger.warning(
+        "⚠️  [SAFE-GATE] %s tronqué : '%s…' → %d chars (max %d)",
+        field_name, value[:30], max_len, max_len,
+    )
+    return truncated
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 1. MESSAGE INTERACTIF — MENU PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -314,11 +468,11 @@ def send_interactive_buttons(
     phone_id, token = _resolve_credentials(config)
 
     if not buttons or len(buttons) > 3:
-        logger.error("send_interactive_buttons : 1 à 3 boutons requis (reçu %d).", len(buttons))
+        logger.error("send_interactive_buttons : 1 à 3 boutons requis (reçu %d).", len(buttons or []))
         return {"error": "invalid_buttons_count"}
 
     formatted_buttons = [
-        {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"][:20]}}
+        {"type": "reply", "reply": {"id": str(btn["id"]), "title": str(btn["title"])}}
         for btn in buttons
     ]
 
@@ -339,6 +493,9 @@ def send_interactive_buttons(
         "type":              "interactive",
         "interactive":       interactive,
     }
+
+    # ── Safe-Gate : validation + troncature automatique ──────────────────
+    validate_meta_payload(payload)
 
     return _post(_build_endpoint(phone_id), token, payload)
 
@@ -385,40 +542,37 @@ def send_list_menu(
         logger.error("send_list_menu : sections vides — envoi annulé.")
         return {"error": "empty_sections"}
 
-    # Respect des limites Meta
-    safe_sections = []
-    total_rows = 0
+    # Construction brute — Safe-Gate se chargera de la troncature
+    raw_sections = []
     for section in sections:
-        rows = []
-        for row in section.get("rows", []):
-            if total_rows >= 10:
-                break
-            rows.append({
-                "id":          str(row.get("id", ""))[:200],
-                "title":       str(row.get("title", ""))[:24],
-                "description": str(row.get("description", ""))[:72],
-            })
-            total_rows += 1
+        rows = [
+            {
+                "id":          str(row.get("id", "")),
+                "title":       str(row.get("title", "")),
+                "description": str(row.get("description", "")),
+            }
+            for row in section.get("rows", [])
+        ]
         if rows:
-            safe_sections.append({
-                "title": str(section.get("title", "Menu"))[:24],
+            raw_sections.append({
+                "title": str(section.get("title", "Menu")),
                 "rows":  rows,
             })
 
     interactive: dict = {
         "type": "list",
-        "body": {"text": body_text[:1024]},
+        "body": {"text": body_text},
         "action": {
-            "button":   button_text[:20],
-            "sections": safe_sections,
+            "button":   button_text,
+            "sections": raw_sections,
         },
     }
     if logo_url:
         interactive["header"] = {"type": "image", "image": {"link": logo_url.strip()}}
     elif header_text:
-        interactive["header"] = {"type": "text", "text": header_text[:60]}
+        interactive["header"] = {"type": "text", "text": header_text}
     if footer_text:
-        interactive["footer"] = {"text": footer_text[:60]}
+        interactive["footer"] = {"text": footer_text}
 
     payload = {
         "messaging_product": "whatsapp",
@@ -427,6 +581,9 @@ def send_list_menu(
         "type":              "interactive",
         "interactive":       interactive,
     }
+
+    # ── Safe-Gate : validation + troncature automatique ──────────────────
+    validate_meta_payload(payload)
 
     return _post(_build_endpoint(phone_id), token, payload)
 
