@@ -63,7 +63,12 @@ from layer3_tools.supabase_tool import (
     health_check as supabase_health,
 )
 from layer3_tools.hubrise_tool import push_to_hubrise, sync_stock_with_supabase, finalize_cart_order
-from layer3_tools.menu_manager import build_menu_sections, send_interactive_menu as _send_main_menu
+from layer3_tools.menu_manager import (
+    build_menu_sections,
+    send_interactive_menu as _send_main_menu,
+    find_product_in_menu,
+    send_product_options,
+)
 from layer3_tools.supabase_tool import cart_upsert, cart_get, cart_clear
 from layer3_tools.alert_tool import send_alert_async, format_exception_alert
 from layer3_tools.supabase_tool import SupabaseClient, TABLE_SNACKS
@@ -286,11 +291,18 @@ def _handle_deletion_request(config: dict, snack_id: str, customer_phone: str) -
 # =============================================================================
 
 def _cart_summary_from_items(items: list) -> str:
-    """Retourne une chaîne récapitulative du panier."""
-    lines = [
-        f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
-        for it in items
-    ]
+    """Retourne une chaîne récapitulative du panier (avec options si présentes)."""
+    lines = []
+    for it in items:
+        line = f"  • {it['qty']}x {it['name']}"
+        if it.get("price"):
+            line += f" — {it['price']:.2f}€"
+        # Affiche l'option choisie si présente dans metadata
+        meta = it.get("metadata", {})
+        opt = meta.get("selected_option", {}) if meta else {}
+        if opt.get("name"):
+            line += f"\n      ↳ {opt['name']}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -634,7 +646,11 @@ def _process_message(
     elif button_id == "add_more":
         _send_main_menu(config, from_phone)
 
-    # 5. Sélection d'un article depuis le List Message
+    # 5. Choix d'option produit (button_reply avec id opt_PRODID_OPTID)
+    elif interactive_type == "button_reply" and button_id.startswith("opt_"):
+        _handle_option_choice(snack_id, from_phone, button_id, config)
+
+    # 6. Sélection d'un article depuis le List Message
     elif interactive_type == "list_reply" and button_id:
         _handle_cart_item(snack_id, from_phone, button_id, message_text, config)
 
@@ -741,10 +757,23 @@ def _handle_cart_item(
     """
     Ajoute l'article sélectionné dans le panier client et envoie une confirmation
     avec deux boutons : continuer les achats ou valider la commande.
+
+    Si l'article possède des options (dans menu_data), envoie d'abord
+    les boutons d'options au lieu d'ajouter directement au panier.
     """
+    menu_data = config.get("menu_data")
+
+    # ── Vérification des options produit ─────────────────────────────────────
+    if menu_data:
+        product = find_product_in_menu(menu_data, item_id)
+        if product and product.get("options"):
+            print(f"🔧 [CART] Produit '{item_title}' a {len(product['options'])} option(s) → envoi boutons options")
+            send_product_options(config, from_phone, product)
+            return  # On attend le button_reply avec le choix d'option
+
+    # ── Pas d'options → ajout direct au panier (flux standard) ──────────────
     # Récupère le prix depuis menu_data si disponible
     price = None
-    menu_data = config.get("menu_data")
     if menu_data:
         sections = build_menu_sections(menu_data)
         for section in sections:
@@ -790,6 +819,115 @@ def _handle_cart_item(
         print(f"✅ [CART] Article ajouté | item={item_id} | phone={_redact(from_phone)} | total={total_items}")
     except Exception as e:
         print(f"⚠️  [CART] Erreur envoi confirmation panier : {e}")
+
+
+def _handle_option_choice(
+    snack_id: str,
+    from_phone: str,
+    button_id: str,
+    config: dict,
+) -> None:
+    """
+    Traite le choix d'une option produit (button_reply avec ID opt_PRODID_OPTID).
+
+    Parse le button_id, retrouve le produit et l'option dans menu_data,
+    puis effectue le cart_upsert avec metadata.selected_option.
+    """
+    # ── Parse du button_id : opt_<product_id>_<option_id> ────────────────────
+    parts = button_id.split("_", 2)  # ["opt", "<product_id>", "<option_id>"]
+    if len(parts) < 3:
+        print(f"⚠️  [OPTIONS] button_id malformé : '{button_id}'")
+        send_text_message(config, from_phone, "⚠️ Erreur de sélection. Veuillez réessayer.")
+        _send_main_menu(config, from_phone)
+        return
+
+    product_id = parts[1]
+    option_id  = parts[2]
+
+    # ── Lookup produit + option dans menu_data ──────────────────────────────
+    menu_data = config.get("menu_data")
+    product   = find_product_in_menu(menu_data, product_id) if menu_data else None
+
+    if not product:
+        print(f"⚠️  [OPTIONS] Produit '{product_id}' introuvable dans menu_data")
+        send_text_message(config, from_phone, "⚠️ Produit introuvable. Veuillez réessayer.")
+        _send_main_menu(config, from_phone)
+        return
+
+    product_name = str(product.get("name", "Article"))
+    price        = product.get("price")
+
+    # Retrouver l'option choisie
+    option_data = None
+    for opt in product.get("options", []):
+        opt_id = str(opt.get("id") or opt.get("name", ""))
+        if opt_id == option_id:
+            option_data = opt
+            break
+
+    option_name = str(option_data.get("name", option_id)) if option_data else option_id
+
+    # Surcharge de prix si l'option en définit un
+    if option_data and option_data.get("price") is not None:
+        try:
+            price = float(option_data["price"])
+        except (ValueError, TypeError):
+            pass
+
+    # ── Nom affiché dans le panier : "Produit (Option)" ─────────────────────
+    display_name = f"{product_name} ({option_name})"
+
+    # ── ID unique dans le panier : évite les doublons produit+option ────────
+    cart_item_id = f"{product_id}:{option_id}"
+
+    # ── Ajout au panier avec metadata ───────────────────────────────────────
+    items = cart_get(from_phone, snack_id)
+    existing = next((it for it in items if it["id"] == cart_item_id), None)
+    if existing:
+        existing["qty"] += 1
+    else:
+        items.append({
+            "id":       cart_item_id,
+            "name":     display_name,
+            "price":    float(price) if isinstance(price, (int, float)) else None,
+            "qty":      1,
+            "metadata": {
+                "product_id": product_id,
+                "selected_option": {
+                    "id":   option_id,
+                    "name": option_name,
+                },
+            },
+        })
+
+    total_price = sum((it.get("price") or 0) * it["qty"] for it in items)
+    cart_upsert(from_phone, snack_id, items, total_price)
+
+    summary     = _cart_summary_from_items(items)
+    total_items = sum(it["qty"] for it in items)
+
+    try:
+        send_interactive_buttons(
+            config=config,
+            recipient_phone=from_phone,
+            header_text=f"🛒 Panier ({total_items} article{'s' if total_items > 1 else ''})",
+            body_text=(
+                f"✅ *{display_name}* ajouté !\n\n"
+                f"*Votre panier :*\n{summary}\n\n"
+                "Que souhaitez-vous faire ?"
+            ),
+            footer_text="SnackFlow • Commande rapide",
+            buttons=[
+                {"id": "add_more",  "title": "➕ Ajouter"},
+                {"id": "view_cart", "title": "🛒 Voir panier"},
+            ],
+        )
+        print(
+            f"✅ [OPTIONS] Article+option ajouté | {product_id}:{option_id} "
+            f"| phone={_redact(from_phone)} | total={total_items}"
+        )
+    except Exception as e:
+        print(f"⚠️  [OPTIONS] Erreur envoi confirmation : {e}")
 
 
 def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
