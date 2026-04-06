@@ -212,24 +212,32 @@ def push_to_hubrise(
 
 def finalize_cart_order(phone: str, config: dict) -> dict:
     """
-    Orchestre la finalisation complète d'une commande client :
+    Orchestre la finalisation complète d'une commande CASH client :
       1. Récupère le panier depuis Supabase (cart_get)
       2. Crée la commande dans Supabase (create_order, status=pending)
-      3. Pousse vers HubRise (push_to_hubrise)
+      3. Pousse vers HubRise avec tag payment='cash' (push_to_hubrise)
       4. Lie l'ID HubRise + met à jour status=confirmed
-      5. Envoie message WhatsApp de confirmation au client
-      6. Envoie notification Telegram au gérant
-      7. Vide le panier Supabase (cart_clear)
+
+    Retourne un dict riche incluant le récapitulatif, le total et le
+    temps d'attente estimé pour que le webhook puisse envoyer la
+    confirmation WhatsApp, l'alerte Telegram et le cart_clear.
 
     :param phone:  Numéro client au format E.164.
     :param config: Dict issu de supabase_tool.get_snack_config().
-    :return: {"status": "ok"|"error", "hubrise_ok": bool, "order_id": str}
+    :return: {
+        "status":        "ok" | "error",
+        "hubrise_ok":    bool,
+        "order_id":      str,
+        "summary":       str,   # récapitulatif formaté
+        "total":         float,
+        "items":         list,   # items bruts du panier
+        "estimated_wait": str,  # temps d'attente estimé
+        "message":       str,   # si erreur
+    }
     """
     from layer3_tools.supabase_tool import (
-        cart_get, cart_clear, create_order, link_hubrise_order, update_order_status,
+        cart_get, create_order, link_hubrise_order, update_order_status,
     )
-    from layer3_tools.alert_tool import notify_telegram
-    from layer3_tools.whatsapp_tool import send_text_message
 
     snack_id    = str(config.get("id") or config.get("snack_id", "")).strip()
     nom_resto   = config.get("nom_resto") or config.get("name", "Le Snack")
@@ -246,7 +254,7 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
         for it in items
     ]
 
-    # 2. Créer la commande dans Supabase
+    # 2. Créer la commande dans Supabase (status=pending, payment=cash)
     order_id: Optional[str] = None
     try:
         res = create_order(
@@ -254,12 +262,12 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
             data={"customer_phone": phone, "items": parsed_items, "status": "pending"},
         )
         order_id = res.get("row", {}).get("id")
-        logger.info("✅ finalize_cart_order : commande créée id=%s", order_id)
+        logger.info("✅ finalize_cart_order : commande CASH créée id=%s", order_id)
     except Exception as e:
         logger.error("❌ finalize_cart_order : create_order échoué : %s", e)
         return {"status": "error", "message": str(e)}
 
-    # 3. Push HubRise
+    # 3. Push HubRise (payment type = cash)
     hubrise_ok = False
     hubrise_id = ""
     try:
@@ -279,7 +287,7 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
             link_hubrise_order(order_id, hubrise_id)
             update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
             hubrise_ok = True
-            logger.info("✅ finalize_cart_order : HubRise push OK | hr_id=%s", hubrise_id)
+            logger.info("✅ finalize_cart_order : HubRise CASH push OK | hr_id=%s", hubrise_id)
         else:
             logger.warning("⚠️  finalize_cart_order : HubRise push non créé : %s", hr_result)
     except Exception as e:
@@ -293,30 +301,24 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
     summary = "\n".join(summary_lines)
     total   = sum((it.get("price") or 0) * it["qty"] for it in items)
 
-    # 5. WhatsApp → client
-    try:
-        hubrise_line = "\n🟢 *Commande transmise en cuisine.*" if hubrise_ok else ""
-        send_text_message(
-            config, phone,
-            f"🧾 *Récapitulatif :*\n\n{summary}{hubrise_line}\n\n"
-            f"✅ Merci chez _{nom_resto}_ 🙏",
-        )
-    except Exception as e:
-        logger.warning("⚠️  finalize_cart_order : WA client échoué : %s", e)
+    # 5. Estimation temps d'attente (heuristique simple basée sur le nombre d'articles)
+    total_items = sum(it["qty"] for it in items)
+    if total_items <= 2:
+        estimated_wait = "10-15 min"
+    elif total_items <= 5:
+        estimated_wait = "15-20 min"
+    else:
+        estimated_wait = "20-30 min"
 
-    # 6. Telegram → gérant
-    hr_info = f"🟢 HubRise transmis (id: {hubrise_id[:8]}…)" if hubrise_ok else "⚠️ HubRise non transmis"
-    total_str = f"{total:.2f}€" if total > 0 else "non calculé"
-    notify_telegram(
-        f"🆕 <b>Nouvelle commande</b> — {nom_resto}\n"
-        f"Client : {phone}\n\n{summary}\n\n"
-        f"Total : {total_str}\n{hr_info}",
-    )
-
-    # 7. Vider le panier
-    cart_clear(phone, snack_id)
-
-    return {"status": "ok", "hubrise_ok": hubrise_ok, "order_id": order_id or ""}
+    return {
+        "status":         "ok",
+        "hubrise_ok":     hubrise_ok,
+        "order_id":       order_id or "",
+        "summary":        summary,
+        "total":          total,
+        "items":          items,
+        "estimated_wait": estimated_wait,
+    }
 
 
 # =============================================================================

@@ -610,7 +610,7 @@ def _process_message(
     Point d'entrée du traitement asynchrone.
     Route vers :
       - _handle_manager_callback()  si gérant + button_id CONFIRM/REJECT/CALL
-      - _handle_cart_validate()     si button_id == "validate_order"
+      - _handle_cmd_validate()      si button_id == "cmd_validate"
       - _handle_view_cart()         si button_id == "view_cart"
       - _send_main_menu()           si button_id == "add_more"
       - _handle_cart_item()         si interactive_type == "list_reply"
@@ -634,9 +634,9 @@ def _process_message(
     ):
         _handle_manager_callback(button_id, from_phone, config, snack_id)
 
-    # 2. Validation finale du panier → push HubRise + notifications
-    elif button_id == "validate_order":
-        _handle_cart_validate(snack_id, from_phone, config)
+    # 2. Validation finale CASH du panier
+    elif button_id == "cmd_validate":
+        _handle_cmd_validate(snack_id, from_phone, config)
 
     # 3. Voir le récapitulatif du panier
     elif button_id == "view_cart":
@@ -948,8 +948,8 @@ def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
             body_text=f"*Récapitulatif :*\n{summary}{total_str}\n\nPrêt à valider ?",
             footer_text="SnackFlow • Commande rapide",
             buttons=[
-                {"id": "add_more",       "title": "➕ Ajouter"},
-                {"id": "validate_order", "title": "✅ Valider"},
+                {"id": "add_more",      "title": "➕ Ajouter"},
+                {"id": "cmd_validate",  "title": "✅ Payer Cash"},
             ],
         )
         print(f"✅ [CART] Vue panier → {_redact(from_phone)} | {len(items)} article(s)")
@@ -957,24 +957,84 @@ def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
         print(f"⚠️  [CART] Erreur vue panier : {e}")
 
 
-def _handle_cart_validate(snack_id: str, from_phone: str, config: dict) -> None:
+def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
     """
-    Délègue la finalisation complète à finalize_cart_order() (hubrise_tool).
-    Cette fonction orchestre : Supabase order, HubRise push, WA client, Telegram gérant, cart clear.
+    Finalise une commande en mode CASH uniquement.
+
+    Flux :
+      1. finalize_cart_order() → création Supabase + push HubRise (payment=cash)
+      2. Envoi WhatsApp client → récapitulatif + total + temps d'attente
+      3. Alerte Telegram gérant → '💰 Nouvelle commande CASH reçue !'
+      4. cart_clear() → panier vidé
     """
+    nom_resto = config.get("nom_resto") or config.get("name", "Le Snack")
+
+    # 1. Finalisation (Supabase + HubRise)
     result = finalize_cart_order(phone=from_phone, config=config)
+
     if result.get("status") == "error":
-        print(f"⚠️  [CART] finalize_cart_order error : {result.get('message')}")
+        print(f"⚠️  [CASH] finalize_cart_order error : {result.get('message')}")
         send_text_message(
             config, from_phone,
             "ℹ️ Votre panier est vide. Utilisez le menu pour sélectionner vos articles.",
         )
         _send_main_menu(config, from_phone)
-    else:
-        print(
-            f"✅ [CART] Commande finalisée | order={result.get('order_id', '?')[:8]} "
-            f"| hubrise={'ok' if result.get('hubrise_ok') else 'skipped'}"
+        return
+
+    summary        = result.get("summary", "")
+    total          = result.get("total", 0)
+    estimated_wait = result.get("estimated_wait", "15-20 min")
+    order_id       = result.get("order_id", "")
+    hubrise_ok     = result.get("hubrise_ok", False)
+
+    total_str  = f"{total:.2f}€" if total > 0 else ""
+    hubrise_line = "\n🟢 *Commande transmise en cuisine.*" if hubrise_ok else ""
+
+    # 2. WhatsApp → client : confirmation + récap + attente
+    try:
+        send_text_message(
+            config, from_phone,
+            f"✅ *Commande confirmée !*\n\n"
+            f"🧾 *Récapitulatif :*\n{summary}\n\n"
+            f"💰 *Paiement : Cash sur place*\n"
+            f"💵 *Total : {total_str}*\n"
+            f"⏱️ *Temps d'attente estimé : {estimated_wait}*"
+            f"{hubrise_line}\n\n"
+            f"Merci pour votre commande chez _{nom_resto}_ ! 🙏",
         )
+    except Exception as e:
+        print(f"⚠️  [CASH] Erreur envoi confirmation WhatsApp : {e}")
+
+    # 3. Telegram → gérant : alerte CASH
+    try:
+        hr_info = f"🟢 HubRise transmis (id: {order_id[:8]}…)" if hubrise_ok else "⚠️ HubRise non transmis"
+        send_alert_async(
+            title=f"💰 Nouvelle commande CASH reçue ! — {nom_resto}",
+            body=(
+                f"Client : {from_phone}\n\n"
+                f"{summary}\n\n"
+                f"Total : {total_str}\n"
+                f"Paiement : CASH sur place\n"
+                f"{hr_info}"
+            ),
+            level="info",
+            extra={
+                "order_id":  order_id[:8] if order_id else "?",
+                "snack":     nom_resto,
+                "total":     total_str,
+                "payment":   "cash",
+            },
+        )
+    except Exception as e:
+        print(f"⚠️  [CASH] Erreur alerte Telegram : {e}")
+
+    # 4. Vider le panier
+    cart_clear(from_phone, snack_id)
+
+    print(
+        f"✅ [CASH] Commande finalisée | order={order_id[:8] if order_id else '?'} "
+        f"| hubrise={'ok' if hubrise_ok else 'skipped'} | total={total_str}"
+    )
 
 
 def _process_new_order(
