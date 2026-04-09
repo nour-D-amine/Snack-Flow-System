@@ -471,9 +471,16 @@ def update_order_status(order_id: str, status: str, snack_id: str = "") -> dict:
 
     :param order_id: UUID de la commande (retourné par log_order / create_order).
     :param status:   "pending" | "confirmed" | "failed" | "cancelled".
-    :param snack_id: (optionnel) UUID du tenant — filtre de sécurité multi-tenant.
+    :param snack_id: UUID du tenant — filtre de sécurité multi-tenant (obligatoire).
     :return: Ligne mise à jour ou dict d'erreur.
     """
+    # O1 — Guard multi-tenant : snack_id obligatoire pour éviter une mise à jour
+    # cross-tenant silencieuse si un appelant oublie de le passer.
+    if not snack_id:
+        raise ValueError(
+            "update_order_status : snack_id requis (isolation multi-tenant). "
+            "Appelez toujours avec snack_id=<uuid>."
+        )
     _valid_statuses = {"pending", "confirmed", "ready", "failed", "cancelled"}
     if status not in _valid_statuses:
         logger.warning("⚠️  update_order_status : statut invalide '%s' → forcé à 'pending'", status)
@@ -820,8 +827,33 @@ def cart_clear(phone_e164: str, snack_id: str) -> dict:
 
 
 # =============================================================================
-# TEST STANDALONE
+# TESTS STANDALONE
 # =============================================================================
+
+def checkout_cart(phone_e164: str, snack_id: str) -> list:
+    """
+    Supprime atomiquement le panier d'un client et retourne ses articles.
+    Empêche les conditions de concurrence (double-click du client) si on scale
+    à 2+ instances backend.
+    Nécessite la fonction RPC 'atomic_checkout_cart' dans Supabase.
+    
+    :param phone_e164: Numéro client au format E.164.
+    :param snack_id:   UUID du restaurant.
+    :return: Liste d'articles ou [] si le panier était déjà vide (ou effacé par une autre instance).
+    """
+    try:
+        sb = SupabaseClient.instance()
+        response = sb.rpc(
+            "atomic_checkout_cart",
+            {"p_phone_e164": phone_e164.strip(), "p_snack_id": snack_id.strip()}
+        ).execute()
+        
+        if response.data:
+            return response.data
+        return []
+    except Exception as e:
+        logger.error("❌ checkout_cart(%s, %s) : %s", phone_e164, snack_id, e)
+        return []
 
 if __name__ == "__main__":
     print("=" * 60)

@@ -10,7 +10,7 @@ Flux :
   push_to_hubrise(order, access_token, location_id)
       │
       ├─► POST https://api.hubrise.com/v1/locations/{location_id}/orders
-      │         {status: "new", payment: cash, items: [...]}
+      │         {status: "new", payment: sur_place, items: [...]}
       │
       └─► Retourne {"hubrise_order_id": "...", "status": "created"}
 
@@ -25,12 +25,13 @@ Architecture v2 — Credentials dynamiques :
 Principes :
   - Zéro clé en dur — tout depuis la base Supabase (colonnes snacks).
   - Self-Healing : si HubRise échoue → log "skipped" sans crasher le flux.
-  - Paiement sur place : payment_type = "cash", status = "new".
+  - Paiement sur place : payment_type = "cash" (valeur requise par l'API HubRise), status = "new".
   - Mapping Gemini → HubRise : name, qty, price avec defaults sûrs.
 """
 
 import copy
 import logging
+import threading
 from typing import Optional
 
 import requests
@@ -47,6 +48,22 @@ logger.setLevel(logging.INFO)
 # ─── Constante ────────────────────────────────────────────────────────────────
 
 HUBRISE_API_BASE = "https://api.hubrise.com/v1"
+
+# ─── C1 — Locks anti double-tap par (phone, snack_id) ─────────────────────────
+# Empêche deux threads concurrents (double-clic client) de créer deux commandes
+# identiques. Non-bloquant : le second thread est éjecté immédiatement.
+
+_order_locks: dict = {}
+_order_locks_meta = threading.Lock()
+
+
+def _get_order_lock(phone: str, snack_id: str) -> threading.Lock:
+    """Retourne (et crée si besoin) un Lock par couple (phone, snack_id)."""
+    key = f"{phone}:{snack_id}"
+    with _order_locks_meta:
+        if key not in _order_locks:
+            _order_locks[key] = threading.Lock()
+        return _order_locks[key]
 
 
 # =============================================================================
@@ -94,7 +111,7 @@ def _build_payload(order: dict) -> dict:
     Règles métier SnackFlow :
       - status       = "new"        (commande reçue, en attente caisse)
       - service_type = "collection" (retrait en restaurant, paiement sur place)
-      - payment.type = "cash"       (paiement sur place — mode 'unpaid')
+      - payment.type = "cash"       (valeur API HubRise pour paiement sur place — mode 'unpaid')
     """
     items = order.get("items", [])
     hub_items = _map_items(items)
@@ -212,11 +229,12 @@ def push_to_hubrise(
 
 def finalize_cart_order(phone: str, config: dict) -> dict:
     """
-    Orchestre la finalisation complète d'une commande CASH client :
-      1. Récupère le panier depuis Supabase (cart_get)
-      2. Crée la commande dans Supabase (create_order, status=pending)
-      3. Pousse vers HubRise avec tag payment='cash' (push_to_hubrise)
-      4. Lie l'ID HubRise + met à jour status=confirmed
+    Orchestre la finalisation complète d'une commande client :
+      1. Acquiert un lock par (phone, snack_id) — éjecte les double-taps (C1)
+      2. Vide le panier immédiatement (ceinture+bretelles anti-doublon)
+      3. Crée la commande dans Supabase (create_order, status=pending)
+      4. Pousse vers HubRise avec paiement sur place (push_to_hubrise)
+      5. Lie l'ID HubRise + met à jour status=confirmed
 
     Retourne un dict riche incluant le récapitulatif, le total et le
     temps d'attente estimé pour que le webhook puisse envoyer la
@@ -236,7 +254,7 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
     }
     """
     from layer3_tools.supabase_tool import (
-        cart_get, create_order, link_hubrise_order, update_order_status,
+        checkout_cart, cart_get, cart_clear, create_order, link_hubrise_order, update_order_status,
     )
 
     snack_id    = str(config.get("id") or config.get("snack_id", "")).strip()
@@ -244,81 +262,96 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
     hr_token    = str(config.get("hubrise_access_token", "") or "").strip()
     hr_loc      = str(config.get("hubrise_location_id", "") or "").strip()
 
-    # 1. Récupérer le panier
-    items = cart_get(phone, snack_id)
-    if not items:
-        return {"status": "error", "message": "Panier vide"}
-
-    parsed_items = [
-        {"name": it["name"], "qty": it["qty"], "price": it.get("price")}
-        for it in items
-    ]
-
-    # 2. Créer la commande dans Supabase (status=pending, payment=cash)
-    order_id: Optional[str] = None
-    try:
-        res = create_order(
-            snack_id=snack_id,
-            data={"customer_phone": phone, "items": parsed_items, "status": "pending"},
+    # ── C1 — Lock anti double-tap ────────────────────────────────────────────
+    lock = _get_order_lock(phone, snack_id)
+    if not lock.acquire(blocking=False):
+        logger.warning(
+            "⚠️  [C1] Double-tap détecté pour phone=%s snack=%s — commande ignorée.", phone, snack_id
         )
-        order_id = res.get("row", {}).get("id")
-        logger.info("✅ finalize_cart_order : commande CASH créée id=%s", order_id)
-    except Exception as e:
-        logger.error("❌ finalize_cart_order : create_order échoué : %s", e)
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Commande déjà en cours de traitement"}
 
-    # 3. Push HubRise (payment type = cash)
-    hubrise_ok = False
-    hubrise_id = ""
     try:
-        hr_result = push_to_hubrise(
-            order={
-                "id":             order_id,
-                "customer_phone": phone,
-                "items":          parsed_items,
-                "status":         "pending",
-            },
-            access_token=hr_token,
-            location_id=hr_loc,
-            snack_name=nom_resto,
-        )
-        if hr_result.get("status") == "created":
-            hubrise_id = hr_result.get("hubrise_order_id", "")
-            link_hubrise_order(order_id, hubrise_id)
-            update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
-            hubrise_ok = True
-            logger.info("✅ finalize_cart_order : HubRise CASH push OK | hr_id=%s", hubrise_id)
+        # ── Ceinture+bretelles atomiques : Supabase atomic DELETE ──────────────
+        # Le thread qui arrive ici vide et récupère le panier en 1 seule requête SQL.
+        # Un second thread qui contournerait le lock (ex: 2 instances Railway)
+        # obtiendra `[]` (panier vide) de la base de données et s'arrêtera là.
+        items = checkout_cart(phone, snack_id)
+        if not items:
+            return {"status": "error", "message": "Panier vide"}
+
+        parsed_items = [
+            {"name": it["name"], "qty": it["qty"], "price": it.get("price")}
+            for it in items
+        ]
+
+        # 2. Créer la commande dans Supabase (status=pending, paiement sur place)
+        order_id: Optional[str] = None
+        try:
+            res = create_order(
+                snack_id=snack_id,
+                data={"customer_phone": phone, "items": parsed_items, "status": "pending"},
+            )
+            order_id = res.get("row", {}).get("id")
+            logger.info("✅ finalize_cart_order : commande créée id=%s", order_id)
+        except Exception as e:
+            logger.error("❌ finalize_cart_order : create_order échoué : %s", e)
+            return {"status": "error", "message": str(e)}
+
+        # 3. Push HubRise (paiement sur place)
+        hubrise_ok = False
+        hubrise_id = ""
+        try:
+            hr_result = push_to_hubrise(
+                order={
+                    "id":             order_id,
+                    "customer_phone": phone,
+                    "items":          parsed_items,
+                    "status":         "pending",
+                },
+                access_token=hr_token,
+                location_id=hr_loc,
+                snack_name=nom_resto,
+            )
+            if hr_result.get("status") == "created":
+                hubrise_id = hr_result.get("hubrise_order_id", "")
+                link_hubrise_order(order_id, hubrise_id)
+                update_order_status(order_id=order_id, status="confirmed", snack_id=snack_id)
+                hubrise_ok = True
+                logger.info("✅ finalize_cart_order : HubRise push OK | hr_id=%s", hubrise_id)
+            else:
+                logger.warning("⚠️  finalize_cart_order : HubRise push non créé : %s", hr_result)
+        except Exception as e:
+            logger.warning("⚠️  finalize_cart_order : push_to_hubrise échoué (non bloquant) : %s", e)
+
+        # 4. Résumé + total
+        summary_lines = [
+            f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
+            for it in items
+        ]
+        summary = "\n".join(summary_lines)
+        total   = sum((it.get("price") or 0) * it["qty"] for it in items)
+
+        # 5. Estimation temps d'attente (heuristique basée sur le nombre d'articles)
+        total_items = sum(it["qty"] for it in items)
+        if total_items <= 2:
+            estimated_wait = "10-15 min"
+        elif total_items <= 5:
+            estimated_wait = "15-20 min"
         else:
-            logger.warning("⚠️  finalize_cart_order : HubRise push non créé : %s", hr_result)
-    except Exception as e:
-        logger.warning("⚠️  finalize_cart_order : push_to_hubrise échoué (non bloquant) : %s", e)
+            estimated_wait = "20-30 min"
 
-    # 4. Résumé + total
-    summary_lines = [
-        f"  • {it['qty']}x {it['name']}" + (f" — {it['price']:.2f}€" if it.get("price") else "")
-        for it in items
-    ]
-    summary = "\n".join(summary_lines)
-    total   = sum((it.get("price") or 0) * it["qty"] for it in items)
+        return {
+            "status":         "ok",
+            "hubrise_ok":     hubrise_ok,
+            "order_id":       order_id or "",
+            "summary":        summary,
+            "total":          total,
+            "items":          items,
+            "estimated_wait": estimated_wait,
+        }
 
-    # 5. Estimation temps d'attente (heuristique simple basée sur le nombre d'articles)
-    total_items = sum(it["qty"] for it in items)
-    if total_items <= 2:
-        estimated_wait = "10-15 min"
-    elif total_items <= 5:
-        estimated_wait = "15-20 min"
-    else:
-        estimated_wait = "20-30 min"
-
-    return {
-        "status":         "ok",
-        "hubrise_ok":     hubrise_ok,
-        "order_id":       order_id or "",
-        "summary":        summary,
-        "total":          total,
-        "items":          items,
-        "estimated_wait": estimated_wait,
-    }
+    finally:
+        lock.release()
 
 
 # =============================================================================

@@ -106,7 +106,7 @@ atexit.register(lambda: _executor.shutdown(wait=True, cancel_futures=False))
 
 # ─── Cache config restaurant (TTL 5 min) ──────────────────────────────────────
 
-CACHE_TTL_SECONDS = 300
+CACHE_TTL_SECONDS = 60   # M2 — réduit de 300s à 60s : limite la fenêtre de stale config sur multi-instances Railway
 _config_cache: dict = {}
 _cache_timestamps: dict = {}
 _cache_lock = threading.Lock()
@@ -524,6 +524,48 @@ def _verify_hubrise_signature() -> bool:
     return hmac.compare_digest(sig_header[7:], expected)
 
 
+# =============================================================================
+# M1 — CSRF OAuth HubRise : state signé HMAC-SHA256 + expiration 10 min
+# =============================================================================
+
+def _make_oauth_state(snack_id: str) -> str:
+    """
+    Génère un state OAuth anti-CSRF signé.
+    Format : "{snack_id}:{timestamp}:{hmac_prefix_16}"
+    Expire dans 10 minutes.
+    """
+    ts  = str(int(time.time()))
+    secret = (WHATSAPP_APP_SECRET or "dev_fallback").encode("utf-8")
+    sig = hmac.new(secret, f"{snack_id}:{ts}".encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{snack_id}:{ts}:{sig}"
+
+
+def _verify_oauth_state(state: str) -> Optional[str]:
+    """
+    Vérifie le state OAuth anti-CSRF.
+    Retourne le snack_id si valide, None sinon (forgé ou expiré).
+    """
+    try:
+        parts = state.split(":")
+        if len(parts) != 3:
+            return None
+        snack_id, ts_str, received_sig = parts
+        if abs(time.time() - int(ts_str)) > 600:   # fenêtre 10 min
+            _logger.warning("⚠️  [M1] OAuth state expiré (ts=%s)", ts_str)
+            return None
+        secret = (WHATSAPP_APP_SECRET or "dev_fallback").encode("utf-8")
+        expected_sig = hmac.new(
+            secret, f"{snack_id}:{ts_str}".encode(), hashlib.sha256
+        ).hexdigest()[:16]
+        if not hmac.compare_digest(received_sig, expected_sig):
+            _logger.warning("⚠️  [M1] Signature CSRF OAuth invalide")
+            return None
+        return snack_id
+    except Exception as exc:
+        _logger.error("❌ [M1] _verify_oauth_state error : %s", exc)
+        return None
+
+
 @app.route("/webhook", methods=["POST"])
 @error_monitor
 def whatsapp_webhook():
@@ -624,6 +666,21 @@ def _process_message(
     resto_phone       = str(config.get("resto_phone", "")).strip()
     _MANAGER_PREFIXES = ("CONFIRM_", "REJECT_", "CALL_")
 
+    # O2 — Guard : préfixe gérant reçu mais resto_phone absent → log explicite
+    # Sans ce guard, le message tomberait silencieusement dans _process_new_order.
+    if (
+        button_id
+        and interactive_type == "button_reply"
+        and not resto_phone
+        and any(button_id.startswith(p) for p in _MANAGER_PREFIXES)
+    ):
+        _logger.warning(
+            "[O2] Préfixe gérant '%s' reçu mais resto_phone non configuré — snack=%s. "
+            "Configurez resto_phone dans Supabase pour activer les callbacks gérant.",
+            button_id[:20], snack_id,
+        )
+        return
+
     # 1. Callbacks gérant (CONFIRM / REJECT / CALL)
     if (
         button_id
@@ -634,7 +691,7 @@ def _process_message(
     ):
         _handle_manager_callback(button_id, from_phone, config, snack_id)
 
-    # 2. Validation finale CASH du panier
+    # 2. Validation finale du panier
     elif button_id == "cmd_validate":
         _handle_cmd_validate(snack_id, from_phone, config)
 
@@ -654,7 +711,7 @@ def _process_message(
     elif interactive_type == "list_reply" and button_id:
         _handle_cart_item(snack_id, from_phone, button_id, message_text, config)
 
-    # 5. Message texte (salutation, commande libre, RGPD…)
+    # 7. Message texte (salutation, commande libre, RGPD…)
     else:
         _process_new_order(snack_id, from_phone, message_text, message_type, config)
 
@@ -685,6 +742,16 @@ def _handle_manager_callback(
     if not order:
         print(f"❌ [CALLBACK] Commande introuvable : {order_id}")
         send_text_message(config, manager_phone, f"❌ Commande introuvable (id: {order_id[:8]}…)")
+        return
+
+    # C2 — Guard idempotent : empêche le double-clic gérant de pousser deux fois sur HubRise
+    current_status = order.get("status", "")
+    if current_status in ("confirmed", "cancelled", "ready"):
+        print(f"ℹ️  [CALLBACK] Doublon ignoré : order={order_id[:8]} status={current_status}")
+        send_text_message(
+            config, manager_phone,
+            f"ℹ️ Cette commande a déjà été traitée (statut : *{current_status}*).",
+        )
         return
 
     customer_phone = order.get("customer_phone", "")
@@ -949,7 +1016,7 @@ def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
             footer_text="SnackFlow • Commande rapide",
             buttons=[
                 {"id": "add_more",      "title": "➕ Ajouter"},
-                {"id": "cmd_validate",  "title": "✅ Payer Cash"},
+                {"id": "cmd_validate",  "title": "✅ Confirmer"},
             ],
         )
         print(f"✅ [CART] Vue panier → {_redact(from_phone)} | {len(items)} article(s)")
@@ -959,12 +1026,12 @@ def _handle_view_cart(snack_id: str, from_phone: str, config: dict) -> None:
 
 def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
     """
-    Finalise une commande en mode CASH uniquement.
+    Finalise une commande client.
 
     Flux :
-      1. finalize_cart_order() → création Supabase + push HubRise (payment=cash)
-      2. Envoi WhatsApp client → récapitulatif + total + temps d'attente
-      3. Alerte Telegram gérant → '💰 Nouvelle commande CASH reçue !'
+      1. finalize_cart_order() → création Supabase + push HubRise (payment sur place)
+      2. Envoi WhatsApp client → récapitulatif + total + temps d'attente estimé
+      3. Alerte Telegram gérant → '🆕 Nouvelle commande reçue !'
       4. cart_clear() → panier vidé
     """
     nom_resto = config.get("nom_resto") or config.get("name", "Le Snack")
@@ -973,7 +1040,7 @@ def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
     result = finalize_cart_order(phone=from_phone, config=config)
 
     if result.get("status") == "error":
-        print(f"⚠️  [CASH] finalize_cart_order error : {result.get('message')}")
+        print(f"⚠️  [COMMANDE] finalize_cart_order error : {result.get('message')}")
         send_text_message(
             config, from_phone,
             "ℹ️ Votre panier est vide. Utilisez le menu pour sélectionner vos articles.",
@@ -996,43 +1063,33 @@ def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
             config, from_phone,
             f"✅ *Commande confirmée !*\n\n"
             f"🧾 *Récapitulatif :*\n{summary}\n\n"
-            f"💰 *Paiement : Cash sur place*\n"
             f"💵 *Total : {total_str}*\n"
             f"⏱️ *Temps d'attente estimé : {estimated_wait}*"
             f"{hubrise_line}\n\n"
             f"Merci pour votre commande chez _{nom_resto}_ ! 🙏",
         )
     except Exception as e:
-        print(f"⚠️  [CASH] Erreur envoi confirmation WhatsApp : {e}")
+        print(f"⚠️  [COMMANDE] Erreur envoi confirmation WhatsApp : {e}")
 
-    # 3. Telegram → gérant : alerte CASH
-    try:
-        hr_info = f"🟢 HubRise transmis (id: {order_id[:8]}…)" if hubrise_ok else "⚠️ HubRise non transmis"
-        send_alert_async(
-            title=f"💰 Nouvelle commande CASH reçue ! — {nom_resto}",
-            body=(
-                f"Client : {from_phone}\n\n"
-                f"{summary}\n\n"
-                f"Total : {total_str}\n"
-                f"Paiement : CASH sur place\n"
+    # 3. WhatsApp → gérant : alerte commande (au lieu de Telegram)
+    resto_phone = str(config.get("resto_phone", "")).strip()
+    if resto_phone:
+        try:
+            hr_info = "🟢 Commande transmise au POS HubRise" if hubrise_ok else "⚠️ Échec transmission HubRise"
+            send_text_message(
+                config, resto_phone,
+                f"🆕 *Nouvelle commande validée !* (Paiement sur place)\n\n"
+                f"📱 Client : wa.me/{from_phone.lstrip('+')}\n\n"
+                f"🧾 *Détail :*\n{summary}\n\n"
+                f"💶 *Total : {total_str}*\n\n"
                 f"{hr_info}"
-            ),
-            level="info",
-            extra={
-                "order_id":  order_id[:8] if order_id else "?",
-                "snack":     nom_resto,
-                "total":     total_str,
-                "payment":   "cash",
-            },
-        )
-    except Exception as e:
-        print(f"⚠️  [CASH] Erreur alerte Telegram : {e}")
-
-    # 4. Vider le panier
-    cart_clear(from_phone, snack_id)
+            )
+            print(f"✅ [COMMANDE] Alerte WhatsApp envoyée au gérant : {_redact(resto_phone)}")
+        except Exception as e:
+            print(f"⚠️  [COMMANDE] Erreur alerte WhatsApp gérant : {e}")
 
     print(
-        f"✅ [CASH] Commande finalisée | order={order_id[:8] if order_id else '?'} "
+        f"✅ [COMMANDE] Finalisée | order={order_id[:8] if order_id else '?'} "
         f"| hubrise={'ok' if hubrise_ok else 'skipped'} | total={total_str}"
     )
 
@@ -1165,7 +1222,7 @@ def hubrise_connect():
         "redirect_uri":  HUBRISE_REDIRECT_URI,
         "scope":         "location[orders.write]",
         "response_type": "code",
-        "state":         snack_id,
+        "state":         _make_oauth_state(snack_id),
     }
     auth_url = HUBRISE_AUTH_URL + "?" + urlencode(params)
     _logger.info("🔗 [HubRise] OAuth redirect → snack_id=%s", snack_id)
@@ -1197,7 +1254,11 @@ def hubrise_callback():
     if not code or not state:
         return jsonify({"error": "Paramètres code et state requis"}), 400
 
-    snack_id = state
+    # M1 — Vérification du state anti-CSRF (HMAC signé + expiration 10 min)
+    snack_id = _verify_oauth_state(state)
+    if not snack_id:
+        _logger.error("❌ [M1] OAuth state invalide ou expiré : '%s'", state[:40])
+        return jsonify({"error": "OAuth state invalide ou expiré — relancez la connexion HubRise"}), 400
 
     # ── Échange code → access_token (HTTP Basic Auth) ────────────────────────
     if not HUBRISE_CLIENT_ID or not HUBRISE_CLIENT_SECRET:
@@ -1356,6 +1417,16 @@ def hubrise_status_webhook():
     customer_phone = order.get("customer_phone", "").strip()
     snack_id       = str(order.get("snack_id", "")).strip()
     internal_id    = str(order.get("id", "")).strip()
+
+    # M3 — Guard cross-tenant : snack_id absent = intégrité compromise
+    # (commande créée avant une migration, ou corruption de données).
+    if not snack_id:
+        _logger.error(
+            "❌ [HUBRISE_WEBHOOK] snack_id absent sur order=%s | hubrise_id=%s — "
+            "notification annulée (risque cross-tenant).",
+            internal_id, hubrise_order_id,
+        )
+        return jsonify({"status": "no_tenant", "order_id": internal_id}), 200
 
     if not customer_phone:
         _logger.error(
