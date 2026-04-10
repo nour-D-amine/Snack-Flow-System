@@ -55,6 +55,7 @@ from layer3_tools.supabase_tool import (
     get_snack_config,
     get_snack_by_phone_id,
     upsert_customer,
+    increment_customer_orders,
     delete_customer_data,
     update_order_status,
     get_order_by_id,
@@ -1031,8 +1032,8 @@ def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
     Flux :
       1. finalize_cart_order() → création Supabase + push HubRise (payment sur place)
       2. Envoi WhatsApp client → récapitulatif + total + temps d'attente estimé
-      3. Alerte Telegram gérant → '🆕 Nouvelle commande reçue !'
-      4. cart_clear() → panier vidé
+      3. Envoi WhatsApp gérant → alerte commande (resto_phone)
+      4. increment_customer_orders() → CRM total_orders += 1
     """
     nom_resto = config.get("nom_resto") or config.get("name", "Le Snack")
 
@@ -1088,6 +1089,12 @@ def _handle_cmd_validate(snack_id: str, from_phone: str, config: dict) -> None:
         except Exception as e:
             print(f"⚠️  [COMMANDE] Erreur alerte WhatsApp gérant : {e}")
 
+    # 4. Incrémenter le compteur de commandes CRM (uniquement après succès)
+    try:
+        increment_customer_orders(phone_e164=from_phone, snack_id=snack_id)
+    except Exception as e:
+        print(f"⚠️  [COMMANDE] increment_customer_orders échoué (non bloquant) : {e}")
+
     print(
         f"✅ [COMMANDE] Finalisée | order={order_id[:8] if order_id else '?'} "
         f"| hubrise={'ok' if hubrise_ok else 'skipped'} | total={total_str}"
@@ -1124,7 +1131,7 @@ def _process_new_order(
     is_new_customer = False
     try:
         customer_data   = upsert_customer(phone_e164=from_phone, snack_id=snack_id)
-        is_new_customer = isinstance(customer_data, dict) and customer_data.get("total_orders", 0) == 1
+        is_new_customer = isinstance(customer_data, dict) and customer_data.get("total_orders", 0) == 0
         print(f"✅ [ORDER] Customer CRM upserted | nouveau={is_new_customer}")
     except Exception as e:
         print(f"⚠️  [ORDER] upsert_customer échoué (non bloquant) : {e}")

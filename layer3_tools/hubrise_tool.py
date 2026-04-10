@@ -291,7 +291,16 @@ def finalize_cart_order(phone: str, config: dict) -> dict:
                 snack_id=snack_id,
                 data={"customer_phone": phone, "items": parsed_items, "status": "pending"},
             )
+            # Guard : si create_order retourne un dict d'erreur sans lever,
+            # on stoppe immédiatement pour ne pas continuer avec order_id=None.
+            if res.get("status") == "error":
+                err_msg = res.get("message", "create_order a échoué")
+                logger.error("❌ finalize_cart_order : create_order erreur silencieuse : %s", err_msg)
+                return {"status": "error", "message": err_msg}
             order_id = res.get("row", {}).get("id")
+            if not order_id:
+                logger.error("❌ finalize_cart_order : create_order n'a pas retourné d'id")
+                return {"status": "error", "message": "create_order n'a pas retourné d'id"}
             logger.info("✅ finalize_cart_order : commande créée id=%s", order_id)
         except Exception as e:
             logger.error("❌ finalize_cart_order : create_order échoué : %s", e)

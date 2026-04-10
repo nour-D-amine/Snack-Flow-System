@@ -614,11 +614,14 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
     """
     Crée ou met à jour le profil CRM d'un client dans la table 'customers'.
 
-    - INSERT la première fois (first_contact = NOW()).
-    - UPDATE last_contact + total_orders += 1 les fois suivantes.
+    - INSERT la première fois (first_contact = NOW(), total_orders = 0).
+    - UPDATE last_contact les fois suivantes (sans incrémenter total_orders).
+
+    Note : total_orders est incrémenté uniquement par increment_customer_orders()
+    appelé lors de la validation effective d'une commande, pas à chaque message.
 
     :param phone_e164: Numéro client au format E.164 (ex: "+33785557054").
-    :param snack_id:   UUID du restaurant (FK vers snacks.id, ou snack_id texte legacy).
+    :param snack_id:   UUID du restaurant (FK vers snacks.id).
     :return: Profil client créé/mis à jour, ou dict d'erreur.
     """
     try:
@@ -637,22 +640,18 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
         )
 
         if existing.data:
-            # Mise à jour : last_contact + compteur commandes
-            current_orders = existing.data[0].get("total_orders", 0) or 0
+            # Mise à jour : last_contact uniquement (pas d'incrément commande)
             response = (
                 sb.table(TABLE_CUSTOMERS)
-                .update({
-                    "last_contact":  now,
-                    "total_orders":  current_orders + 1,
-                })
+                .update({"last_contact": now})
                 .eq("phone_e164", phone)
                 .eq("snack_id",   sid)
                 .execute()
             )
             result = response.data[0] if response.data else existing.data[0]
-            logger.info("✅ Customer mis à jour : %s → snack=%s", phone, sid)
+            logger.info("✅ Customer contact mis à jour : %s → snack=%s", phone, sid)
         else:
-            # Insertion
+            # Insertion (total_orders = 0 : sera incrémenté à la validation)
             response = (
                 sb.table(TABLE_CUSTOMERS)
                 .insert({
@@ -660,7 +659,7 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
                     "snack_id":             sid,
                     "first_contact":        now,
                     "last_contact":         now,
-                    "total_orders":         1,
+                    "total_orders":         0,
                     "remarketing_eligible": False,
                 })
                 .execute()
@@ -672,6 +671,50 @@ def upsert_customer(phone_e164: str, snack_id: str) -> dict:
 
     except Exception as e:
         logger.error("❌ upsert_customer(%s, %s) : %s", phone_e164, snack_id, e)
+        return {"error": str(e)}
+
+
+def increment_customer_orders(phone_e164: str, snack_id: str) -> dict:
+    """
+    Incrémente total_orders d'un client après validation effective d'une commande.
+
+    Appelé uniquement dans le flux de validation (cmd_validate / finalize_cart_order),
+    jamais sur un simple message entrant.
+
+    :param phone_e164: Numéro client au format E.164.
+    :param snack_id:   UUID du restaurant.
+    :return: Profil mis à jour ou dict d'erreur.
+    """
+    try:
+        sb    = SupabaseClient.instance()
+        phone = phone_e164.strip()
+        sid   = snack_id.strip()
+
+        existing = (
+            sb.table(TABLE_CUSTOMERS)
+            .select("total_orders")
+            .eq("phone_e164", phone)
+            .eq("snack_id", sid)
+            .execute()
+        )
+        if not existing.data:
+            logger.warning("⚠️  increment_customer_orders : client %s introuvable pour snack %s", phone, sid)
+            return {"error": "client introuvable"}
+
+        current = existing.data[0].get("total_orders", 0) or 0
+        response = (
+            sb.table(TABLE_CUSTOMERS)
+            .update({"total_orders": current + 1})
+            .eq("phone_e164", phone)
+            .eq("snack_id",   sid)
+            .execute()
+        )
+        result = response.data[0] if response.data else {}
+        logger.info("✅ increment_customer_orders : %s → total=%d", phone, current + 1)
+        return result
+
+    except Exception as e:
+        logger.error("❌ increment_customer_orders(%s, %s) : %s", phone_e164, snack_id, e)
         return {"error": str(e)}
 
 

@@ -61,6 +61,9 @@ def build_menu_sections(menu_data) -> list:
     # Format 3 — dict de catégories
     elif isinstance(menu_data, dict):
         for cat_name, items in menu_data.items():
+            # Skip les clés internes (ex: _out_of_stock ajouté par sync_stock)
+            if cat_name.startswith("_"):
+                continue
             if not isinstance(items, list):
                 continue
             rows = []
@@ -98,8 +101,8 @@ def send_interactive_menu(config: dict, phone: str) -> None:
         send_text_message(
             config, phone,
             f"👋 Bienvenue chez *{nom_resto}* !\n\n"
-            "Notre menu interactif n'est pas encore configuré.\n"
-            "Écrivez votre commande directement et nous la traiterons rapidement. 🙏",
+            "Notre menu est en cours de configuration.\n"
+            "Veuillez réessayer dans quelques instants. 🙏",
         )
         return
 
@@ -123,8 +126,8 @@ def send_interactive_menu(config: dict, phone: str) -> None:
         logger.error("❌ Le menu interactif a été rejeté par Meta : %s. Passage au fallback texte.", result.get("error"))
         fallback_msg = (
             f"👋 Bienvenue chez *{nom_resto}* !\n\n"
-            "Nous rencontrons un problème pour afficher notre menu interactif.\n"
-            "Veuillez simplement écrire votre commande directement en message (ex: *1 burger classique avec frites*). 🙏"
+            "Nous rencontrons un problème technique pour afficher notre menu.\n"
+            "Veuillez réessayer dans quelques instants ou nous contacter directement. 🙏"
         )
         send_text_message(config, phone, fallback_msg)
     else:
@@ -174,6 +177,8 @@ def find_product_in_menu(menu_data, product_id: str) -> dict | None:
     # Format 3 — dict de catégories
     elif isinstance(menu_data, dict):
         for _cat_name, items in menu_data.items():
+            if _cat_name.startswith("_"):
+                continue
             if not isinstance(items, list):
                 continue
             for item in items:
